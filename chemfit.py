@@ -175,7 +175,7 @@ def apply_standard_mask(exclude, original_mask = False):
     masks = {'all': {'all': []}, 'continuum': []}
     if type(original_mask) is not bool:
         masks['continuum'] += original_mask['continuum']
-    masks['continuum'] += list(exclude)
+    masks['continuum'] += list(copy.deepcopy(exclude))
     masks['continuum'].sort(key = lambda x: x[0])
     merged = []
     for interval in masks['continuum']:
@@ -255,6 +255,11 @@ def initialize(*presets):
             public_functions = [name for name in dir(module) if name.startswith(prefix := 'public__')]
             for name in public_functions:
                 globals()[name[len(prefix):]] = getattr(module, name)
+
+            # See if the module has references for base chemfit functions that need to be populated
+            references = [name for name in dir(module) if name.startswith(prefix := 'main__')]
+            for name in references:
+                setattr(module, name, globals()[name[len(prefix):]])
 
 # Load the default settings preset
 initialize()
@@ -1349,6 +1354,7 @@ def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent'):
     warnings_stack_length = len(warnings_stack)
 
     # Set default initial guesses
+    initial = copy.deepcopy(initial)
     if 'default_initial' in settings:
         for param in settings['default_initial']:
             if (param not in initial):
