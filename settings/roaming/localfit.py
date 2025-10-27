@@ -14,7 +14,15 @@
 ############################################################
 
 
-import atlas
+try:
+    import atlas
+except:
+    raise ValueError('Could not import BasicATLAS. Make sure BasicATLAS is installed and available in your Python environment')
+
+if 'scratch' not in original_settings:
+    raise ValueError('You must create a local settings preset (settings/local/localfit.py) that defines the "scratch" key to point to the intended scratch directory (temporary storage for new models)')
+
+
 import pickle
 import scipy as scp
 import hashlib
@@ -60,25 +68,25 @@ settings = {
     # Which individual elements to fit, and the lines of which species (atomic, molecular and ionic) should be considered
     # when calculating the abundance of each element. All species are specified as Kurucz codes
     'elements': {
-       # 'Ba': [56, 56.01, 56.02, 56.03, 56.04, 56.05],
-       # 'Eu': [63, 63.01, 63.02, 63.03, 63.04, 63.05],
+       'Ba': [56, 56.01, 56.02, 56.03, 56.04, 56.05],
+       'Eu': [63, 63.01, 63.02, 63.03, 63.04, 63.05],
        'Mg': [12, 12.01, 12.02, 12.03, 12.04, 12.05, 112.0, 812.0, 112.01, 10812.0],
-       # 'Si': [14, 14.01, 14.02, 14.03, 14.04, 14.05, 114.0, 814.0, 114.01, 80814.0, 101010114.0, 614.0, 60614.0],
-       # 'Ca': [20, 20.01, 20.02, 20.03, 20.04, 20.05, 120.0, 820.0, 120.01, 10820.0],
-       # 'Ti': [22, 22.01, 22.02, 22.03, 22.04, 22.05, 122.0], #, 822.0],
-       # 'Ni': [28, 28.01, 28.02, 28.03, 28.04, 28.05, 128.0, 828.0],
-       # 'Na': [11, 11.01, 11.02, 11.03, 11.04, 11.05, 111.0, 10811.0],
+       'Si': [14, 14.01, 14.02, 14.03, 14.04, 14.05, 114.0, 814.0, 114.01, 80814.0, 101010114.0, 614.0, 60614.0],
+       'Ca': [20, 20.01, 20.02, 20.03, 20.04, 20.05, 120.0, 820.0, 120.01, 10820.0],
+       'Ti': [22, 22.01, 22.02, 22.03, 22.04, 22.05, 122.0], #, 822.0],
+       'Ni': [28, 28.01, 28.02, 28.03, 28.04, 28.05, 128.0, 828.0],
+       'Na': [11, 11.01, 11.02, 11.03, 11.04, 11.05, 111.0, 10811.0],
        'Fe': [26, 26.01, 26.02, 26.03, 26.04, 26.05, 126.0, 826.0],
-       # 'Mn': [25, 25.01, 25.02, 25.03, 25.04, 25.05, 125.0, 825.0],
-       # 'Co': [27, 27.01, 27.02, 27.03, 27.04, 27.05, 127.0, 827.0],
-       # 'Li': [3, 3.01, 3.02, 3.03, 3.04, 3.05, 103.0],
-       # 'Al': [13, 13.01, 13.02, 13.03, 13.04, 13.05, 113.0, 813.0, 113.01],
-       # 'K': [19, 19.01, 19.02, 19.03, 19.04, 19.05, 119.0],
-       # 'Cr': [24, 24.01, 24.02, 24.03, 24.04, 24.05, 124.0, 824.0],
-       # 'La': [57, 57.01, 57.02, 57.03, 57.04, 57.05, 857.0],
-       # 'Sc': [21, 21.01, 21.02, 21.03, 21.04, 21.05, 121.0, 821.0],
-       # 'V': [23, 23.01, 23.02, 23.03, 23.04, 23.05, 123.0, 823.0],
-       # 'Y': [39, 39.01, 39.02, 39.03, 39.04, 39.05, 839.0],
+       'Mn': [25, 25.01, 25.02, 25.03, 25.04, 25.05, 125.0, 825.0],
+       'Co': [27, 27.01, 27.02, 27.03, 27.04, 27.05, 127.0, 827.0],
+       'Li': [3, 3.01, 3.02, 3.03, 3.04, 3.05, 103.0],
+       'Al': [13, 13.01, 13.02, 13.03, 13.04, 13.05, 113.0, 813.0, 113.01],
+       'K': [19, 19.01, 19.02, 19.03, 19.04, 19.05, 119.0],
+       'Cr': [24, 24.01, 24.02, 24.03, 24.04, 24.05, 124.0, 824.0],
+       'La': [57, 57.01, 57.02, 57.03, 57.04, 57.05, 857.0],
+       'Sc': [21, 21.01, 21.02, 21.03, 21.04, 21.05, 121.0, 821.0],
+       'V': [23, 23.01, 23.02, 23.03, 23.04, 23.05, 123.0, 823.0],
+       'Y': [39, 39.01, 39.02, 39.03, 39.04, 39.05, 839.0],
     },
 
     # Minimum change in normalized spectrum between the lowest and highest abundances of an element in order to be included
@@ -161,7 +169,7 @@ def notify(message, color = 'k'):
     if not settings['silent']:
         print(prefix + message + suffix, flush = True)
 
-def build_linelist(species, output_dir, C12C13, air_wl, wl_start, wl_end, res, vturb, atoms, invert = False):
+def build_linelist(species, output_dir, C12C13, air_wl, wl_start, wl_end, res, vturb, atoms, invert = False, full_linelist = False):
     """Build a SYNTHE linelist (fort.12) for a given wavelength range and list of species to include
 
     This function first dispatches the SYNBEG code from the SYNTHE suite that prepares the header of the calculation (fort.93). The
@@ -194,6 +202,9 @@ def build_linelist(species, output_dir, C12C13, air_wl, wl_start, wl_end, res, v
     invert : bool, optional
         If `True`, include all species except for the ones specified in `species`. Otherwise (default), include only the species specified in
         `species`
+    full_linelist : str, optional
+        If the complete linelist has already been built (i.e. the list that includes all species), it may be provided here so it is not
+        recomputed
     """
     # Helper function to convert Kurucz species codes into NELION index. The NELION index is how they are stored in the linelist
     def code_to_nelion(code):
@@ -215,51 +226,58 @@ def build_linelist(species, output_dir, C12C13, air_wl, wl_start, wl_end, res, v
         raise ValueError('{} already exists'.format(output_dir))
     os.mkdir(output_dir)
 
-    # Get the part of the SYNTHE launcher script in BasicATLAS that prepares the line list
-    script = atlas.templates.synthe_control
-    start = script.find('# synberg.exe initializes the computation')
-    end = script.find('# synthe.exe computes line opacities')
-    if start == -1 or end == -1:
-        raise ValueError('LOCALFIT no longer compatible with BasicATLAS')
-    script = 'cd {output}\n' + script[start:end]
+    if type(full_linelist) is bool:
+        # We first build the full linelist, i.e. one that includes all species. The unwanted lines
+        # will be removed from it later
+        # Get the part of the SYNTHE launcher script in BasicATLAS that prepares the line list
+        script = atlas.templates.synthe_control
+        start = script.find('# synberg.exe initializes the computation')
+        end = script.find('# synthe.exe computes line opacities')
+        if start == -1 or end == -1:
+            raise ValueError('LOCALFIT no longer compatible with BasicATLAS')
+        script = 'cd {output}\n' + script[start:end]
 
-    # Run the extracted part of the launcher script
-    C13 = 1 / (C12C13 + 1)
-    C12 = 1 - C13
-    C12C13_cmd = 'echo "{} {}" > c12c13.dat'.format(np.log10(C12), np.log10(C13))
-    atoms_linelist = os.path.realpath(atlas.python_path + '/data/synthe_files/{}.dat'.format(atoms))
-    if not os.path.isfile(atoms_linelist):
-        raise ValueError('Linelist {} not found'.format(atoms_linelist))
-    cards = {
-        's_files': atlas.python_path + '/data/synthe_files/',
-        'd_files': atlas.python_path + '/data/dfsynthe_files/',
-        'synthe_suite': atlas.python_path + '/bin/',
-        'airorvac': ['VAC', 'AIR'][air_wl],
-        'wlbeg': wl_start,
-        'wlend': wl_end,
-        'resolu': res,
-        'turbv': vturb,
-        'linelist': atoms_linelist,
-        'C12C13': C12C13_cmd,
-        'ifnlte': 0,
-        'linout': -1,
-        'cutoff': 0.0001,
-        'ifpred': 1,
-        'nread': 0,
-        'output': os.path.realpath(output_dir),
-    }
-    f = open(output_dir + '/packager.com', 'w')
-    f.write(script.format(**cards))
-    f.close()
-    command = 'bash {}/packager.com'.format(output_dir)
-    session = subprocess.Popen(command, stdout = subprocess.PIPE, stderr = subprocess.PIPE, shell = True)
-    stdout, stderr = session.communicate()
-    stdout = stdout.decode().strip()
-    stderr = stderr.decode().strip()
-    if stderr != '':
-        raise ValueError('Command {} returned an error: {}'.format(command, stderr))
-    if stdout != '':
-        print(stdout, file = sys.stderr)
+        # Run the extracted part of the launcher script
+        C13 = 1 / (C12C13 + 1)
+        C12 = 1 - C13
+        C12C13_cmd = 'echo "{} {}" > c12c13.dat'.format(np.log10(C12), np.log10(C13))
+        atoms_linelist = os.path.realpath(atlas.python_path + '/data/synthe_files/{}.dat'.format(atoms))
+        if not os.path.isfile(atoms_linelist):
+            raise ValueError('Linelist {} not found'.format(atoms_linelist))
+        cards = {
+            's_files': atlas.python_path + '/data/synthe_files/',
+            'd_files': atlas.python_path + '/data/dfsynthe_files/',
+            'synthe_suite': atlas.python_path + '/bin/',
+            'airorvac': ['VAC', 'AIR'][air_wl],
+            'wlbeg': wl_start,
+            'wlend': wl_end,
+            'resolu': res,
+            'turbv': vturb,
+            'linelist': atoms_linelist,
+            'C12C13': C12C13_cmd,
+            'ifnlte': 0,
+            'linout': -1,
+            'cutoff': 0.0001,
+            'ifpred': 1,
+            'nread': 0,
+            'output': os.path.realpath(output_dir),
+        }
+        f = open(output_dir + '/packager.com', 'w')
+        f.write(script.format(**cards))
+        f.close()
+        command = 'bash {}/packager.com'.format(output_dir)
+        session = subprocess.Popen(command, stdout = subprocess.PIPE, stderr = subprocess.PIPE, shell = True)
+        stdout, stderr = session.communicate()
+        stdout = stdout.decode().strip()
+        stderr = stderr.decode().strip()
+        if stderr != '':
+            raise ValueError('Command {} returned an error: {}'.format(command, stderr))
+        if stdout != '':
+            print(stdout, file = sys.stderr)
+    else:
+        # If the full linelist has been calculated before, just copy it
+        for filename in os.listdir(full_linelist):
+            shutil.copy('{}/{}'.format(full_linelist, filename), '{}/{}'.format(output_dir, filename))
 
     if len(species) > 0 or (not invert):
         # Filter lines to include the species we want
@@ -328,15 +346,23 @@ def build_all_linelists(output_dir, elements, higher_order_impact, C12C13, air_w
     if not os.path.isdir(output_dir):
         os.mkdir(output_dir)
 
+    # Build the null (all-inclusive) linelist first
+    build_linelist([], output_dir + '/null', C12C13, air_wl, wl_start, wl_end, res, vturb, atoms, invert = True)
+
+    # Now build element-specific linelists
+    higher_order_linelist = False
     for element in elements:
         if element not in higher_order_impact:
             species = elements[element]
         else:
-            species = sum(list(elements.values()), [])
-        build_linelist(species, output_dir + '/{}'.format(element), C12C13, air_wl, wl_start, wl_end, res, vturb, atoms)
-
-    # Build the null (all-inclusive) line list as well
-    build_linelist([], output_dir + '/null', C12C13, air_wl, wl_start, wl_end, res, vturb, atoms, invert = True)
+            # Since the linelist of all elements in `higher_order_linelist` are exactly the same, we do not need to recompute them
+            if type(higher_order_linelist) is not bool:
+                shutil.copytree(higher_order_linelist, output_dir + '/{}'.format(element))
+                continue
+            else:
+                higher_order_linelist = output_dir + '/{}'.format(element)
+                species = sum(list(elements.values()), [])
+        build_linelist(species, output_dir + '/{}'.format(element), C12C13, air_wl, wl_start, wl_end, res, vturb, atoms, full_linelist = output_dir + '/null')
 
 def update_abundances(filename, abun_offsets):
     """Update chemical abundances in the output_summary.out file, which BasicATLAS uses to specify the abundance vector
@@ -1074,12 +1100,20 @@ def extract_results(fit, propagate_gridfit = False, detector_wl = False):
         residuals = (fit['extra']['observed']['flux'] - (fit['extra']['model']['cont'] * fit['extra']['model']['flux']))[fit['extra']['mask']] * fit['extra']['observed']['ivar'][fit['extra']['mask']] ** 0.5
         chi2_red = np.sum(residuals ** 2) / (np.shape(jacobian)[0] - np.shape(jacobian)[1])
 
+        # Handle degrees of freedom with zero Jacobians
+        singular = np.array([np.all(jacobian[:,i] == 0.0) for i in range(len(dof))])
+        if np.any(singular):
+            notify('The spectrum is insensitive to {}'.format(','.join(np.array(dof)[singular])), color = 'r')
+
         # Compute the covariance matrix and update the errors in abundances
-        weighted_jacobian = jacobian * (fit['extra']['observed']['ivar'] ** 0.5)[fit['extra']['mask']][:, np.newaxis]
+        weighted_jacobian = jacobian[:,~singular] * (fit['extra']['observed']['ivar'] ** 0.5)[fit['extra']['mask']][:, np.newaxis]
         fit['extra']['abun']['cov'] = np.linalg.inv(weighted_jacobian.T @ weighted_jacobian) * chi2_red
-        fit['extra']['abun']['dof'] = dof
+        fit['extra']['abun']['dof'] = np.array(dof)[~singular].tolist()
         for element in settings['elements']:
-            fit['extra']['abun']['errors']['[{}/H]'.format(element)] = np.sqrt(fit['extra']['abun']['cov'][tuple([dof.index(element)] * 2)])
+            if element in fit['extra']['abun']['dof']:
+                fit['extra']['abun']['errors']['[{}/H]'.format(element)] = np.sqrt(fit['extra']['abun']['cov'][tuple([fit['extra']['abun']['dof'].index(element)] * 2)])
+            else:
+                fit['extra']['abun']['errors']['[{}/H]'.format(element)] = np.inf
 
     return fit
 
@@ -1144,14 +1178,16 @@ def public__localfit(wl, flux, ivar, gridfit, level = 1, niter = 5):
     params = copy.deepcopy(gridfit)
     intermediate = [] # Storage for intermediate abundances at the end of each iteration
 
-    for iteration in range([1, niter][level in [3, 4, 5]]):
+    actual_niter = [1, niter][level in [3, 4, 5]]
+    for iteration in range(actual_niter):
         notify('*** Starting iteration {} ***'.format(iteration + 1), color = 'm')
         fit = main__chemfit(wl, flux, ivar, initial = params)
-        for element in settings['elements']:
-            params[element] = fit['fit'][element]
-            settings['initial_abundance_offsets'][element] = fit['fit'][element]
+        if iteration != actual_niter - 1:
+            for element in settings['elements']:
+                params[element] = fit['fit'][element]
+                settings['initial_abundance_offsets'][element] = fit['fit'][element]
+            settings['use_initial_abundance_offsets_in_structure'] = level == 5
         fit = extract_results(fit, propagate_gridfit = False)
-        settings['use_initial_abundance_offsets_in_structure'] = level == 5
         intermediate += [copy.deepcopy(fit['extra']['abun'])]
         notify('Completed iteration {}: {}\n'.format(iteration + 1, fit['extra']['abun']), color = 'm')
     notify('*** Completed all iterations ***')
