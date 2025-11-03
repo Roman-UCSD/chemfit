@@ -1146,6 +1146,10 @@ def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator,
     exec('\n'.join(f)[f[0].find('def'):], scope)
     f = scope['f']
 
+    # As we add statistical and photometric priors, keep track of which one is which so we can provide their
+    # labels to the user in diagnostic data
+    prior_labels = []
+
     # Add priors. Each prior is just an extra pixel in the spectrum
     index = 1
     for param in sorted(list(priors.keys())):
@@ -1153,6 +1157,7 @@ def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator,
             x = np.concatenate([np.array([-index]), x])
             y = np.concatenate([np.array([priors[param][0]]), y])
             sigma = np.concatenate([np.array([priors[param][1]]), sigma])
+            prior_labels += [param]
             index += 1
 
     # Add photometric colors
@@ -1161,11 +1166,27 @@ def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator,
         x = np.concatenate([np.array([-index * 100]), x])
         y = np.concatenate([np.array([phot[color][0]]), y])
         sigma = np.concatenate([np.array([phot[color][1]]), sigma])
+        prior_labels += [color]
         index += 1
 
-    # Run the optimizer and save the results in "initial" and "errors"
-    # fit = mcmc_fit(f, x, y, p0 = p0, bounds = bounds, sigma = sigma)
-    fit = globals()['fit_{}'.format(method)](f, x, y, p0, sigma, bounds)
+    if method == 'cov':
+        # If only the covariance is requested, we assume that "p0" has the best-fit parameters
+        # and estimate the covariance matrix from the Jacobian using the standard formula
+        #       COV = (J^T x diag(IVAR) x J)^-1 * CHI^2_REDUCED
+        # where
+        #       CHI^2_REDUCED = (SUM((OBSERVED - MODEL)^2 * IVAR) / (N_points - N_params))
+        jacobian = scp.optimize._numdiff.approx_derivative(lambda args: f(x, *args), p0)
+        residuals = (y - f(x, *p0)) / sigma
+        chi2_red = np.sum(residuals ** 2) / (np.shape(jacobian)[0] - np.shape(jacobian)[1])
+        weighted_jacobian = jacobian * (1 / sigma)[:, np.newaxis]
+        cov = np.linalg.inv(weighted_jacobian.T @ weighted_jacobian) * chi2_red
+        fit = [p0, np.diag(cov) ** 0.5, {'cov': cov}]
+
+    else:
+        # Run the optimizer
+        fit = globals()['fit_{}'.format(method)](f, x, y, p0, sigma, bounds)
+
+    # Save the results in "initial" and "errors"
     for i, param in enumerate(dof):
         initial[param] = fit[0][i]
         errors[param] = fit[1][i]
@@ -1174,7 +1195,7 @@ def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator,
     if settings['return_diagnostics']:
         fit[2]['observed'] = {'wl': wl, 'flux': flux, 'ivar': ivar}
         fit[2]['mask'] = mask
-        fit[2]['fit'] = {'x': x, 'y': y, 'sigma': sigma, 'f': f(x, *fit[0]), 'p0': p0, 'bounds': bounds, 'dof': dof}
+        fit[2]['fit'] = {'x': x, 'y': y, 'sigma': sigma, 'f': f(x, *fit[0]), 'p0': p0, 'bounds': bounds, 'dof': dof, 'priors': prior_labels[::-1]}
         fit[2]['model'] = {'wl': diagnostic['model_wl'], 'flux': diagnostic['model_flux'], 'cont': diagnostic['model_cont']}
         fit[2]['cost'] = (fit[2]['fit']['f'] - fit[2]['fit']['y']) ** 2.0 / fit[2]['fit']['sigma'] ** 2.0
         fit[2]['arm_index'] = arm_index
@@ -1200,7 +1221,12 @@ def fit_gradient_descent(f, x, y, p0, sigma, bounds):
     extra : dict
         Dictionary with a single key, 'cov', that contains the covariance matrix of the fit
     """
-    fit = scp.optimize.curve_fit(f, x, y, p0 = p0, sigma = sigma, bounds = bounds, **settings['gradient_descent']['curve_fit'])
+    options = copy.deepcopy(settings['gradient_descent']['curve_fit'])
+    # If the total number of data points is 1, it is impossible to normalize chi^2 so we need to
+    # treat the provided errors as absolute regardless of the settings
+    if len(x) == 1:
+        options['absolute_sigma'] = True
+    fit = scp.optimize.curve_fit(f, x, y, p0 = p0, sigma = sigma, bounds = bounds, **options)
     best = fit[0]
     errors = np.sqrt(np.diagonal(fit[1]))
     return best, errors, {'cov': fit[1]}
@@ -1308,7 +1334,7 @@ def fit_mcmc(f, x, y, p0, sigma, bounds):
         extra['gradient_descent']['errors'] = errors
     return np.median(flatchain, axis = 0), np.std(flatchain, axis = 0), extra
 
-def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent'):
+def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent', dof = False):
     """Determine the stellar parameters of a star given its spectrum
     
     Parameters
@@ -1338,7 +1364,13 @@ def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent'):
     method : str
         Method to use for model fitting. Currently supported methods are 'gradient_descent' that
         employs the Trust Region Reflective algorithm implemented in `scipy`, and 'mcmc' that uses
-        the MCMC sampler implemented in `emcee`
+        the MCMC sampler implemented in `emcee`. This parameter can also be set to 'cov' in which
+        case no fitting will be carried out. Instead, it will be assumed that `initial` is already
+        the best-fit values, and the fitter will compute the covariance matrix from the local
+        Jacobian using the standard error propagation formula
+    dof : list
+        List of degrees of freedom to fit for. Defaults to `False`, in which case the list is adopted
+        from `settings['fit_dof']`
     
     Returns
     -------
@@ -1401,9 +1433,12 @@ def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent'):
     fit = {param: np.atleast_1d(initial[param])[0] for param in initial}       # Initial guesses for the fitter
     errors = {}                                                                # Placeholder for fitting errors
 
+    # Which degrees of freedom to fit for?
+    if type(dof) is bool:
+        dof = settings['fit_dof']
 
     # Run the main fitter
-    extra = fit_model(wl_combined, flux_combined, ivar_combined, fit, initial, np.atleast_1d(settings['fit_dof']), errors, masks, interpolator, arm_index, phot, method = method)
+    extra = fit_model(wl_combined, flux_combined, ivar_combined, fit, initial, np.atleast_1d(dof), errors, masks, interpolator, arm_index, phot, method = method)
 
     # Get the texts of unique issued warnings
     warnings = np.unique(warnings_stack[warnings_stack_length:])
