@@ -1175,7 +1175,7 @@ def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator,
         #       COV = (J^T x diag(IVAR) x J)^-1 * CHI^2_REDUCED
         # where
         #       CHI^2_REDUCED = (SUM((OBSERVED - MODEL)^2 * IVAR) / (N_points - N_params))
-        jacobian = scp.optimize._numdiff.approx_derivative(lambda args: f(x, *args), p0)
+        jacobian = scp.optimize._numdiff.approx_derivative(lambda args: f(x, *args), p0, bounds = bounds)
         residuals = (y - f(x, *p0)) / sigma
         chi2_red = np.sum(residuals ** 2) / (np.shape(jacobian)[0] - np.shape(jacobian)[1])
         weighted_jacobian = jacobian * (1 / sigma)[:, np.newaxis]
