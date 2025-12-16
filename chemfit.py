@@ -1073,7 +1073,9 @@ def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator,
         `fit_{method}(f, x, y, p0, sigma, bounds)`, where the arguments have the same meaning as those
         used by `scipy.optimize.curve_fit()`. The callable must return 3 values: best-fit parameter values
         in the same order as accepted by `f()`, errors in the best-fit parameter values, and a dictionary of
-        additional data from the fit (e.g. covariance matrices, MCMC chains etc)
+        additional data from the fit (e.g. covariance matrices, MCMC chains etc). Alternatively, this argument
+        can be set to 'cov' to only calculate the covariance matrix (no fitting, the initial guesses are
+        assumed to be the best-fit parameters) or 'jac' to obtain both the covariance matrix and the Jacobian
     Returns
     -------
     dict
@@ -1169,22 +1171,34 @@ def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator,
         prior_labels += [color]
         index += 1
 
-    if method == 'cov':
+    if method in ['cov', 'jac']:
         # If only the covariance is requested, we assume that "p0" has the best-fit parameters
-        # and estimate the covariance matrix from the Jacobian using the standard formula
+        fit = [p0, None, {}]
+    else:
+        # Otherwise, we compute the best-fit parameters by running the optimizer
+        fit = list(globals()['fit_{}'.format(method.split('+')[0])](f, x, y, p0, sigma, bounds))
+
+    if method.endswith('cov') or method.endswith('jac'):
+        # Estimate the covariance matrix from the Jacobian using the standard formula
         #       COV = (J^T x diag(IVAR) x J)^-1 * CHI^2_REDUCED
         # where
         #       CHI^2_REDUCED = (SUM((OBSERVED - MODEL)^2 * IVAR) / (N_points - N_params))
-        jacobian = scp.optimize._numdiff.approx_derivative(lambda args: f(x, *args), p0, bounds = bounds)
-        residuals = (y - f(x, *p0)) / sigma
+        jacobian = scp.optimize._numdiff.approx_derivative(lambda args: f(x, *args), fit[0], bounds = bounds)
+        residuals = (y - f(x, *fit[0])) / sigma
         chi2_red = np.sum(residuals ** 2) / (np.shape(jacobian)[0] - np.shape(jacobian)[1])
         weighted_jacobian = jacobian * (1 / sigma)[:, np.newaxis]
-        cov = np.linalg.inv(weighted_jacobian.T @ weighted_jacobian) * chi2_red
-        fit = [p0, np.diag(cov) ** 0.5, {'cov': cov}]
-
-    else:
-        # Run the optimizer
-        fit = globals()['fit_{}'.format(method)](f, x, y, p0, sigma, bounds)
+        U, s, VT = scp.linalg.svd(weighted_jacobian, full_matrices = False)
+        threshold = np.finfo(float).eps * max(weighted_jacobian.shape) * s[0]
+        s = s[s > threshold]
+        VT = VT[:s.size]
+        cov = (VT.T / s**2) @ VT * chi2_red
+        extra = {'cov': cov}
+        if method.endswith('jac'):
+            extra['jac'] = jacobian
+        if method in ['cov', 'jac']:
+            fit = [fit[0], np.diag(cov) ** 0.5, extra]
+        else:
+            fit[2] = {**fit[2], **extra}
 
     # Save the results in "initial" and "errors"
     for i, param in enumerate(dof):
@@ -1367,7 +1381,11 @@ def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent', dof
         the MCMC sampler implemented in `emcee`. This parameter can also be set to 'cov' in which
         case no fitting will be carried out. Instead, it will be assumed that `initial` is already
         the best-fit values, and the fitter will compute the covariance matrix from the local
-        Jacobian using the standard error propagation formula
+        Jacobian using the standard error propagation formula. If this argument is set to 'jac', both
+        the covariance matrix and the Jacobian will be returned. Finally, 'gradient_descent'/'mcmc'
+        can be combined with 'cov'/'jac' uing '+' (e.g. 'gradient_descent+jac'), in which case the
+        optimizer will be ran first and the covariance matrix and/or Jacobian will be computed around
+        the best-fit values
     dof : list
         List of degrees of freedom to fit for. Defaults to `False`, in which case the list is adopted
         from `settings['fit_dof']`
