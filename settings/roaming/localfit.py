@@ -634,7 +634,10 @@ def preprocess_grid_model(wl, flux, params, meta):
         notify('({}) Computing {} response function{} ({})'.format(meta['model_indices'], len(to_compute), ['', 's'][int(len(to_compute) > 1)], ','.join(['{}={}'.format(*response) for response in to_compute])), color = 'y')
         for response in to_compute:
             abun = copy.deepcopy(meta['null_abun'])
-            abun[response[0]] = response[1]
+            if response[0] in meta['gridfit_abun']:
+                abun[response[0]] = meta['gridfit_abun'][response[0]] + response[1]
+            else:
+                abun[response[0]] = response[1]
             xnfpelsyn.f5[:,:] = meta['structure']
             xnfpelsyn.update_abun(params['zscale'], abun, Y = 0.245, std_round = False)
             xnfpelsyn.run()
@@ -642,7 +645,9 @@ def preprocess_grid_model(wl, flux, params, meta):
             synthe.load_linelist(*linelists[response[0]], VTURB_LOGG(params['logg']))
             synthe.run()
             synthe.asynth[meta['element_masks'][response[0]]] += meta['asynth']['null'][meta['element_masks'][response[0]]] - meta['asynth'][response[0]]
-            xnfpelsyn.xnfpelsyn_output = meta['null_xnfpelsyn']
+            # Reset the output of XNFPELSYN so we use the null-spectrum continuum in all response functions
+            for field in meta['null_xnfpelsyn']:
+                xnfpelsyn.xnfpelsyn_output[field][...] = meta['null_xnfpelsyn'][field]
             spectrv.load_xnfpelsyn(xnfpelsyn)
             spectrv.load_synthe(synthe)
             spectrv.mask[:] = meta['element_masks'][response[0]]
@@ -858,8 +863,6 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
         errors, as well as the full covariance matrix estimated with `extract_results(..., propagate_gridfit = False, ...)`.
         The intermediate abundances determined at the end of each iteration are also provided
     """
-    global _global
-
     # Check that all basegrid parameters and all virtual parameters are present in `gridfit`
     basegrid_dof = ['teff', 'logg', 'zscale', 'alpha', 'carbon']
     required = basegrid_dof + [param for param in settings['virtual_dof'] if param not in settings['elements']]
@@ -873,6 +876,7 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
     settings['compute_new_structure'] = level in [2, 4, 5]
     settings['initial_abundance_offsets'] = {}
     settings['use_initial_abundance_offsets_in_structure'] = level in [2, 4, 5]
+    settings['fit_dof'] = [param for param in settings['gridfit_offsets'] if len(settings['gridfit_offsets'][param]) > 1] + ['redshift'] + [element for element in settings['elements']]
 
     # Apply initial offsets
     for element in initial_abundance_offsets:
@@ -882,13 +886,12 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
             raise ValueError('Element {} in initial abundance offsets exceeds the allowed range'.format(element))
         settings['initial_abundance_offsets'][element] = initial_abundance_offsets[element]
 
-    params = copy.deepcopy(gridfit)
+    params = {**gridfit, **settings['initial_abundance_offsets']}
     intermediate = [] # Storage for intermediate abundances at the end of each iteration
 
     actual_niter = [1, niter][level in [3, 4, 5]]
     for iteration in range(actual_niter):
         notify('*** Starting iteration {} ***'.format(iteration + 1), color = 'm')
-        notify('gridfit_params={}\ninitial_abundance_offsets={}\ncompute_new_structure={} | use_initial_abundance_offsets_in_structure={}'.format(settings['gridfit_params'], settings['initial_abundance_offsets'], settings['compute_new_structure'], settings['use_initial_abundance_offsets_in_structure']), color = 'm')
         fit = main__chemfit(wl, flux, ivar, initial = params, method = ['gradient_descent', 'gradient_descent+jac'][int(iteration == actual_niter - 1)])
         if iteration != actual_niter - 1:
             for element in settings['elements']:
@@ -898,7 +901,7 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
             settings['use_initial_abundance_offsets_in_structure'] = level == 5
         fit = extract_results(fit, propagate_gridfit = False)
         intermediate += [copy.deepcopy(fit['extra']['abun'])]
-        notify('Completed iteration {}: {}\n'.format(iteration + 1, fit['extra']['abun']), color = 'm')
+        notify('Completed iteration {}: {}\n'.format(iteration + 1, {param: '{:.2f}±{:.2f}'.format(fit['extra']['abun']['abun'][param], fit['extra']['abun']['errors'][param]) for param in fit['extra']['abun']['errors']}), color = 'm')
     notify('*** Completed all iterations ***\n')
 
     fit = extract_results(fit, propagate_gridfit = True, detector_wl = wl)
@@ -906,7 +909,3 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
     del fit['extra']['jac']
 
     return fit
-
-def public__get_global():
-    global _global
-    return _global
