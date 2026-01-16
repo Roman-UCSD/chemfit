@@ -37,10 +37,10 @@ settings = {
     'scratch': original_settings['scratch'],
 
     ### Which elements to fit using live synthesis? [min, max, step] ###
-    'elements': {'O': [-1.0, 1.0, 0.1], 'C': [-1.0, 1.0, 0.1], 'Fe': [-1.0, 1.0, 0.1]},
+    'elements': {'C': [-1.0, 1.0, 0.1], 'Fe': [-1.0, 1.0, 0.1], 'Mg': [-1.0, 1.0, 0.1], 'Na': [-1.0, 1.0, 0.1]},
 
     ### Binning factor for new spectra ###
-    'binning': 10,
+    'binning': 1,
 
     ### Suppress status messages? ###
     'silent': False,
@@ -597,7 +597,12 @@ def generate_structure(structure, pradk, header, footer, model):
 
     return output
 
-def public__generate_response_functions(model):
+def public__generate_response_functions(model, return_structure = False, return_ATLAS = False):
+    def interpolator(teff, logg, values, target_teff, target_logg):
+        if teff[0] == teff[1] and logg[0] == logg[1]:
+            return values[0][0]
+        return scp.interpolate.RegularGridInterpolator([teff, logg], values)([target_teff, target_logg])[0]
+
     # Determine which teff and logg we will be interpolating the model structure from
     grid = read_grid_dimensions()
     if model['teff'] in grid['teff']:
@@ -623,6 +628,7 @@ def public__generate_response_functions(model):
             structure, penalty, offsets = generate_spectrum(params, run_synthesis = False)
             notify('  {}:{} {} (penalty: {:.1f})'.format(i, j, structure, penalty))
             z = zipfile.ZipFile(settings['structures_dir'] + '/' + structure[:structure.find('/')], 'r')
+            # print(structure)
             structure_file = [filename for filename in z.namelist() if filename.startswith(structure[structure.find('/') + 1:]) and filename.endswith('output_summary.out')][0]
             last_iteration_file = [filename for filename in z.namelist() if filename.startswith(structure[structure.find('/') + 1:]) and filename.endswith('output_last_iteration.out')][0]
             data = z.read(structure_file).decode()
@@ -635,9 +641,11 @@ def public__generate_response_functions(model):
             header = '\n'.join(data[:start])
             footer = '\n'.join(data[end + 1:])
             z.close()
-    pradk = scp.interpolate.RegularGridInterpolator([[teff_low, teff_high], [logg_low, logg_high]], pradk)([model['teff'], model['logg']])[0]
-    structure = scp.interpolate.RegularGridInterpolator([[teff_low, teff_high], [logg_low, logg_high]], structures)([model['teff'], model['logg']])[0]
-    last_iteration = scp.interpolate.RegularGridInterpolator([[teff_low, teff_high], [logg_low, logg_high]], last_iteration)([model['teff'], model['logg']])[0]
+    structure = interpolator([teff_low, teff_high], [logg_low, logg_high], structures, model['teff'], model['logg'])
+    if return_structure:
+        return structure
+    pradk = interpolator([teff_low, teff_high], [logg_low, logg_high], pradk, model['teff'], model['logg'])
+    last_iteration = interpolator([teff_low, teff_high], [logg_low, logg_high], last_iteration, model['teff'], model['logg'])
     structure = generate_structure(structure, pradk, header, footer, model)
 
     # Save the interpolated model structure
@@ -649,6 +657,8 @@ def public__generate_response_functions(model):
     f = open('{}/output_main.out'.format(model_dir), 'w')
     f.close()
     np.savetxt('{}/output_last_iteration.out'.format(model_dir), last_iteration)
+    if return_ATLAS:
+        return model_dir
 
     # Compute a test spectrum to determine the flux error penalty
     notify('Running a penalty test in {}'.format(model_dir))
@@ -678,3 +688,7 @@ def public__generate_response_functions(model):
     rescalc.compute_response(output, model_dir, linelist_dir_copy, silent = settings['silent'])
 
     return output, linelist_dir, penalty
+
+def public__structures_index():
+    global livesyn_structures_index
+    return livesyn_structures_index
