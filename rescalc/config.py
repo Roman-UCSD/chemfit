@@ -69,7 +69,7 @@ settings = {
 
     'slurm': {
         'queue': 'shared',
-        'account': 'csd835',
+        'account': 'csd958',
         'nodes': 1,
         'mem_per_cpu': 2000,
     }

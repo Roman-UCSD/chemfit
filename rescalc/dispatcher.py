@@ -477,10 +477,6 @@ def rescalc():
     tally = {'successful': 0, 'incomplete': 0, 'excluded': 0, 'created': 0}
     messages = []
 
-    if type(settings['sparse_sampling']['ref_teff_logg']) is not bool:
-        ref_teff, ref_logg = np.load(settings['sparse_sampling']['ref_teff_logg'])
-        included = sparse_sampling(griddef.teff, griddef.logg, ref_teff, ref_logg, pad_teff = settings['sparse_sampling']['pad_teff'], pad_logg = settings['sparse_sampling']['pad_logg'], sparse_teff = settings['sparse_sampling']['sparse_teff'], sparse_logg = settings['sparse_sampling']['sparse_logg'])
-
     models = set(os.listdir(settings['ATLAS']['output_dir']))
     results = os.listdir(settings['results_dir'])
     results = {'_'.join(result.split('_')[:-1]): result.split('_')[-1] == 'complete' for result in results}
@@ -488,7 +484,10 @@ def rescalc():
     spectra_per_script = int(input_default('Spectra per script?', 1))
     new = []
 
-    for model in tqdm.tqdm(models):
+    # We are computing models out of order to ensure that the sampling is as uniform as possible when incomplete
+    shuffled_models = list(models)
+    np.random.shuffle(shuffled_models)
+    for model in tqdm.tqdm(shuffled_models):
         if model in results and results[model]:
             tally['successful'] += 1
             continue
@@ -499,6 +498,13 @@ def rescalc():
             continue
 
         teff, logg = model.split('_')[-2:]
+
+        # This is for excluding certain models from TiO calculation
+        # zscale = float(model.split('_')[0][1:])
+        # alpha = float(model.split('_')[1][1:])
+        # if int(teff) > 6000 or (int(teff) > 5000 and zscale + alpha < 0):
+        #     tally['excluded'] += 1
+        #     continue
 
         new += [model]
 

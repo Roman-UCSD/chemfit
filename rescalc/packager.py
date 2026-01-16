@@ -64,7 +64,10 @@ total_size = 0
 binned_size = 0
 
 for model in models:
-    shutil.copy('{{}}/{{}}/response.pkl'.format(model_dir, model), destination := ('{{}}/{{}}.pkl'.format(fullres_dir, model)))
+    origin = '{{}}/{{}}/response.pkl'.format(model_dir, model)
+    if not os.path.isfile(origin):
+        continue
+    shutil.copy(origin, destination := ('{{}}/{{}}.pkl'.format(fullres_dir, model)))
     f = open(destination, 'rb')
     response = pickle.load(f)
     f.close()

@@ -1,0 +1,26 @@
+diff --git a/atlas.py b/atlas.py
+index a0e7978..1039dda 100644
+--- a/atlas.py
++++ b/atlas.py
+@@ -161,6 +161,21 @@ def atlas_converged(run_dir, print_result = False, silent = False, niter = 0):
+             max_de += [88888.888]
+             continue
+ 
++        # Check if this iteration is forbidden
++        import glob
++        current_temp = np.loadtxt(iteration.split('\n')[4:-1], unpack = True, usecols = [2])
++        found = False
++        for forbidden in glob.glob('/expanse/lustre/projects/csd835/rgerasim/pfsgrid/ATLAS_forbidden_structures/{}/*.out'.format(os.path.basename(run_dir))):
++            fbd_temp = np.loadtxt(forbidden, unpack = True, usecols = [2])
++            if np.allclose(current_temp, fbd_temp):
++                print('------------ FORBIDDEN ITERATION REMOVED ---------------')
++                max_err += [88888.888]
++                max_de += [88888.888]
++                found = True
++                break
++        if found:
++            continue
++
+         # Remove header and footer
+         s = iteration.split('\n')[4:-1]
+         assert(len(s) == 72)
