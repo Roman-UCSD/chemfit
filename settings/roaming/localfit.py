@@ -35,6 +35,8 @@ import shutil
 import copy
 import sys
 
+import gc, ctypes
+
 # Import PyTLAS. PyTLAS should check itself if it is properly compiled
 sys.path.append('{}/PyTLAS/'.format(atlas.python_path))
 import PyTLAS
@@ -61,7 +63,7 @@ settings = {
     # Lowest convergence class for newly calculated model atmospheres which is considered acceptable. If a newly calculated
     # model atmosphere does not meet this criterion (has a worse convergence class), an exception is raised. This setting
     # is only relevant if 'compute_new_structure' is `True`
-    'min_convergence': 'SILVER',
+    'min_convergence': 'BRONZE',
 
     # Offsets in the abundances of individual elements (from the chemistry of stellar parameters), at which the null
     # spectra and the model atmospheres (if 'compute_new_structure' and 'use_initial_abundance_offsets_in_structure' are
@@ -820,6 +822,22 @@ def extract_results(fit, propagate_gridfit = False, detector_wl = False):
 
     return fit
 
+def free_memory(clear_linelist):
+    global linelists, synthe, spectrv
+
+    del synthe.f12, synthe.f19, synthe.meta, synthe.asynth, synthe.xnfpelsyn_output
+    del spectrv.meta, spectrv.xnfpelsyn_output, spectrv.asynth, spectrv.spectrum
+    if clear_linelist:
+        del linelists
+
+    gc.collect()
+    libc = ctypes.CDLL('libc.so.6')
+    libc.malloc_trim(0)
+
+    if clear_linelist:
+        linelists = {}
+    return
+
 def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, level = 1, niter = 5):
     """Determine the abundances of individual elements using response functions computed at runtime
     
@@ -894,17 +912,21 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
         notify('*** Starting iteration {} ***'.format(iteration + 1), color = 'm')
         fit = main__chemfit(wl, flux, ivar, initial = params, method = ['gradient_descent', 'gradient_descent+jac'][int(iteration == actual_niter - 1)])
         if iteration != actual_niter - 1:
+            free_memory(True)
             for element in settings['elements']:
                 settings['initial_abundance_offsets'][element] = fit['fit'][element]
             for param in settings['fit_dof']:
                 params[param] = fit['fit'][param]
             settings['use_initial_abundance_offsets_in_structure'] = level == 5
+        else:
+            free_memory(False)
         fit = extract_results(fit, propagate_gridfit = False)
         intermediate += [copy.deepcopy(fit['extra']['abun'])]
         notify('Completed iteration {}: {}\n'.format(iteration + 1, {param: '{:.2f}±{:.2f}'.format(fit['extra']['abun']['abun'][param], fit['extra']['abun']['errors'][param]) for param in fit['extra']['abun']['errors']}), color = 'm')
     notify('*** Completed all iterations ***\n')
 
     fit = extract_results(fit, propagate_gridfit = True, detector_wl = wl)
+    free_memory(True)
     fit['extra']['abun']['intermediate'] = intermediate
     del fit['extra']['jac']
 
