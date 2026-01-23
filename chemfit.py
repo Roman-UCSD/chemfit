@@ -698,7 +698,7 @@ class ModelGridInterpolator:
             'num_interpolators_built': Total number of interpolator objects constructed
                                        (scipy.interpolate.RegularGridInterpolator)
     """
-    def __init__(self, resample = True, detector_wl = None, synphot_bands = [], mag_system = settings['default_mag_system'], reddening = settings['default_reddening'], max_models = 10000):
+    def __init__(self, resample = True, detector_wl = None, synphot_bands = [], mag_system = settings['default_mag_system'], reddening = settings['default_reddening'], dof = False, max_models = 10000):
         """
         Parameters
         ----------
@@ -723,6 +723,9 @@ class ModelGridInterpolator:
             Magnitude system to use for synthetic photometry. Must be supported by `synphot()`
         reddening : float, optional
             Optical reddening parameter (E(B-V)) to use for synthetic photometry
+        dof : list
+            List of degrees of freedom in the fit. This is necessary to decide if resampling of
+            the model spectra should occur on read or on access. Defaults to `settings['fit_dof']`
         max_models : int, optional
             Maximum number of models to keep in the loaded models cache. If exceeded, the
             models loaded earliest will be removed from the cache. Higher numbers lead to
@@ -744,6 +747,10 @@ class ModelGridInterpolator:
         setattr(self, '_loaded', {})
         setattr(self, '_loaded_ordered', [])
         setattr(self, '_max_models', max_models)
+        if type(dof) is bool:
+            setattr(self, '_dof', settings['fit_dof'])
+        else:
+            setattr(self, '_dof', dof)
 
         # Models embedded into the current interpolator
         setattr(self, '_interpolator_models', set())
@@ -837,7 +844,7 @@ class ModelGridInterpolator:
         # Decide if we want to run preprocessing / resampling after the model is read or after it is accessed
         # The former choice makes sense if no virtual dimensions are being fit. Since virtual parameters can
         # change their values between accesses, we need to run preprocessing / resampling after each access
-        resample_after_read = len(list(set(settings['fit_dof']) & set(settings['virtual_dof']))) == 0
+        resample_after_read = len(list(set(self._dof) & set(settings['virtual_dof']))) == 0
 
         # Parallelization
         if ('parallel' in settings) and (settings['parallel'] == True):
@@ -1245,6 +1252,57 @@ def fit_gradient_descent(f, x, y, p0, sigma, bounds):
     errors = np.sqrt(np.diagonal(fit[1]))
     return best, errors, {'cov': fit[1]}
 
+def mcmc_convergence(chain, c = 5):
+    """Calculate the convergence parameters of an MCMC chain
+    
+    This function takes the chain output by emcee, and computes the auto-correlation length and the
+    Geweke drift for each dimension of the parameter space
+    
+    Parameters
+    ----------
+    chain : array_like
+        MCMC chain as returned by `emcee.EnsembleSampler().get_chain()`
+    c : number, optional
+        Step size for the auto-correlation window search (see `emcee.autocorr.integrated_time()`)
+    
+    Returns
+    -------
+    autocorr : array_like
+        Array of the numbers of auto-correlation lengths contained within the provided chain for each
+        parameter. The emcee documentaion recommends requiring chains to contain at least 50 auto-
+        correlation lengths to be considered reliable
+    geweke : array_like
+        Array of Geweke drifts (z-scores) for each parameter. The Geweke score reflects the degree
+        of statistical consistency between the first and last quarters of the chain. Chains with
+        scores between -2 and 2 are generally considered well-converged
+    """
+    try:
+        import emcee
+    except:
+        raise ImportError('emcee not installed')
+
+    nsteps, nwalkers, ndim = chain.shape
+
+    tau = emcee.autocorr.integrated_time(chain, c = c, quiet = True)
+    autocorr = nsteps / tau
+
+    geweke = np.zeros(ndim)
+    series = chain.mean(axis = 1)
+    n = series.shape[0]
+    m = int(0.25 * n)
+    for i in range(ndim):
+        a = series[:m, i]
+        b = series[-m:, i]
+
+        tau_a = emcee.autocorr.integrated_time(a[:, None, None], c = c, quiet = True, tol = 0)[0]
+        tau_b = emcee.autocorr.integrated_time(b[:, None, None], c = c, quiet = True, tol = 0)[0]
+
+        var_mean_a = a.var(ddof = 1) * tau_a / len(a)
+        var_mean_b = b.var(ddof = 1) * tau_b / len(b)
+        geweke[i] = (a.mean() - b.mean()) / np.sqrt(var_mean_a + var_mean_b)
+
+    return autocorr, geweke
+
 def fit_mcmc(f, x, y, p0, sigma, bounds):
     """Fit a 2D data series to a model using Markov Chain Monte Carlo (MCMC) sampling
     
@@ -1270,47 +1328,6 @@ def fit_mcmc(f, x, y, p0, sigma, bounds):
         import emcee
     except:
         raise ImportError('emcee not installed')
-
-    def mcmc_convergence(chain, c = 5):
-        """Calculate the convergence parameters of an MCMC chain
-        
-        This function takes the chain output by emcee, and computes the autocorrelation length and the
-        Geweke drift for each dimension of the parameter space
-        
-        Parameters
-        ----------
-        chain : array_like
-            MCMC chain as returned by `emcee.EnsembleSampler().get_chain()`
-        c : number, optional
-            Step size for the autocorrelation window search (see `emcee.autocorr.integrated_time()`)
-        
-        Returns
-        -------
-        autocorr : array_like
-            2D array with autocorrelation lengths for each parameter (first dimension) and each walker
-            (second dimension), expressed as the number of autocorrelation lengths contained within the
-            provided chain. Larger values indicate better convergence (emcee documentaion recommends
-            requiring the minimum value of this array to exceed 50)
-        geweke : array_like
-            Array of Geweke drifts (z-scores) for each parameter. Larger values indicate poor convergence
-        """
-        nsteps, nwalkers, ndim = np.shape(chain)
-        autocorr = np.zeros([ndim, nwalkers])
-        geweke = np.zeros(ndim)
-        for i in range(ndim):
-            for w in range(nwalkers):
-                f = emcee.autocorr.function_1d(chain[:, w, i])
-                taus = 2.0 * np.cumsum(f) - 1.0
-                windows = emcee.autocorr.auto_window(taus, c)
-                tau = taus[windows]
-                autocorr[i,w] = nsteps / tau
-
-            flatchain = chain.reshape(chain.shape[0] * chain.shape[1], -1)
-            a = flatchain[:len(flatchain) // 4, i]
-            b = flatchain[-len(flatchain) // 4:, i]
-            geweke[i] = (np.mean(a) - np.mean(b)) / (np.var(a) + np.var(b)) ** 0.5
-
-        return autocorr, geweke
 
     # Choose initial walker positions
     if settings['mcmc']['initial'] == 'gradient_descent':
@@ -1340,7 +1357,7 @@ def fit_mcmc(f, x, y, p0, sigma, bounds):
     sampler.run_mcmc(initial, settings['mcmc']['nsteps'], progress = settings['mcmc']['progress'])
     chain = sampler.get_chain(flat = False)
     autocorr, geweke = mcmc_convergence(chain)
-    flatchain = chain[settings['mcmc']['discard']:,:,:].reshape((chain.shape[0] - settings['mcmc']['discard']) * chain.shape[1], -1)
+    flatchain = chain.reshape((chain.shape[0]) * chain.shape[1], -1)
     extra = {'chain': chain, 'log_prob': sampler.get_log_prob(), 'initial': initial, 'autocorr': autocorr, 'geweke': geweke}
     if settings['mcmc']['initial'] == 'gradient_descent':
         extra['gradient_descent'] = extra_gd
@@ -1414,6 +1431,10 @@ def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent', dof
     wl_combined, flux_combined, arm_index = combine_arms(wl, flux, return_arm_index = True)
     ivar_combined = combine_arms(wl, ivar)[1]
 
+    # Which degrees of freedom to fit for?
+    if type(dof) is bool:
+        dof = settings['fit_dof']
+
     # Build the interpolator and resampler
     synphot_bands = [color.split('#') for color in phot if len(color.split('#')) == 2]
     if 'reddening' in phot:
@@ -1424,7 +1445,7 @@ def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent', dof
         mag_system = phot['mag_system']
     else:
         mag_system = settings['default_mag_system']
-    interpolator = ModelGridInterpolator(detector_wl = wl, synphot_bands = synphot_bands, reddening = reddening, mag_system = mag_system, max_models = settings['max_model_cache'])
+    interpolator = ModelGridInterpolator(detector_wl = wl, synphot_bands = synphot_bands, reddening = reddening, mag_system = mag_system, dof = dof, max_models = settings['max_model_cache'])
 
     # Get the fitting masks for each parameter
     masks = {}
@@ -1450,10 +1471,6 @@ def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent', dof
     # Preliminary setup
     fit = {param: np.atleast_1d(initial[param])[0] for param in initial}       # Initial guesses for the fitter
     errors = {}                                                                # Placeholder for fitting errors
-
-    # Which degrees of freedom to fit for?
-    if type(dof) is bool:
-        dof = settings['fit_dof']
 
     # Run the main fitter
     extra = fit_model(wl_combined, flux_combined, ivar_combined, fit, initial, np.atleast_1d(dof), errors, masks, interpolator, arm_index, phot, method = method)

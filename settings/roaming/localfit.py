@@ -34,6 +34,7 @@ import subprocess
 import shutil
 import copy
 import sys
+import tempfile, glob
 
 import gc, ctypes
 
@@ -123,9 +124,12 @@ settings = {
     # Allow parallel calculation of ODFs (only relevant if 'compute_new_structure' is `True`)
     'ODF_multithreading': False,
 
-    # We want to cache all calculated models so that the null-spectra and opacities can be reused once calculated without storing
-    # them on disk
+    # We want to cache all calculated models so that the null-spectra and opacities can be reused once calculated
     'max_model_cache': 99999,
+
+    # If True, chemfit will prioritize low memory usage over performance by storing opacity tables on disk and avoiding running
+    # operations on the entire linelist
+    'conserve_memory': False,
 
     # Scratch directory to store atmospheric structures and linelists. Must be specified in the local settings preset
     'scratch': original_settings['scratch'],
@@ -135,15 +139,15 @@ settings = {
 }
 
 # Define the ranges of "virtual" parameters (i.e. parameters that are not dimensions of the model grid). For this preset, the virtual parameters
-# are element abundances and redshift
-settings['virtual_dof'] = {'redshift': [-300, 300], **{element: [np.min(settings['abun']), np.max(settings['abun'])] for element in settings['elements']}}
+# are element abundances
+settings['virtual_dof'] = {element: [np.min(settings['abun']), np.max(settings['abun'])] for element in settings['elements']}
 
-# Which degrees of freedom (parameters) to consider in the fit? Here, we include redshift, element abundances and whichever stellar parameters
+# Which degrees of freedom (parameters) to consider in the fit? Here, we include element abundances and whichever stellar parameters
 # are allowed to vary by the 'gridfit_offsets' setting
-settings['fit_dof'] = [param for param in settings['gridfit_offsets'] if len(settings['gridfit_offsets'][param]) > 1] + ['redshift'] + [element for element in settings['elements']]
+settings['fit_dof'] = [param for param in settings['gridfit_offsets'] if len(settings['gridfit_offsets'][param]) > 1] + [element for element in settings['elements']]
 
 # Default initial guesses for the parameters
-settings['default_initial'] = {'redshift': 0.0, **{element: 0.0 for element in settings['elements']}}
+settings['default_initial'] = {element: 0.0 for element in settings['elements']}
 
 # Relationship between C12/C13 isotope ratio and surface gravity from Kirby+2015
 C12C13_kirby_2015 = lambda logg: np.where(logg > 2.7, 50, np.where(logg <= 2.0, 6, 63 * logg - 120))
@@ -151,8 +155,9 @@ C12C13_kirby_2015 = lambda logg: np.where(logg > 2.7, 50, np.where(logg <= 2.0, 
 # Relationship between VTURB and LOGG based on DEIMOS spectra from Gerasimov+2026
 VTURB_LOGG = lambda logg: 2.792 * np.exp(-0.241 * logg -0.118)
 
-# Global variable to store the linelists
+# Global variables to store the linelists and the path to the master linelist on disk
 linelists = {}
+loaded_linelist_path = None
 
 # Global variable to store the header of the ATLAS restart database
 ATLAS_restarts_header = atlas.restarts.load_header()
@@ -369,7 +374,7 @@ def read_grid_dimensions():
         Placeholder grid points. Each element corresponds to a grid dimension (e.g. teff, logg etc), and the values are lists that
         contain the central value and the offset values
     """
-    global ATLAS_restarts_header, linelists
+    global ATLAS_restarts_header, linelists, loaded_linelist_path
 
     # Check that the GRIDFIT stellar parameters are fully specified
     if (type(settings['gridfit_params']) is bool) or (settings['gridfit_params'].keys() != set(['teff', 'logg', 'zscale', 'alpha', 'carbon'])):
@@ -402,21 +407,67 @@ def read_grid_dimensions():
             raise
         notify('Linelist compiled!', color = 'g')
 
-    # Load the master linelist into memory and sort it by element
-    notify('Loading linelist...'.format(linelist_dir), color = 'y')
-    linelist = PyTLAS.load_linelist(linelist_dir)
-    linelists = {}
-    null_mask = np.full(len(linelist[0]), True)
-    for element in settings['elements']:
-        element_mask = np.isin(linelist[0]['f3'], [code_to_nelion(code) for code in settings['elements'][element]])
-        element_meta = copy.deepcopy(linelist[2])
-        element_meta['n_lines'] = np.count_nonzero(element_mask)
-        element_meta['n_lines_f19'] = 0
-        null_mask &= ~element_mask
-        linelists[element] = (linelist[0][element_mask], linelist[1][:0], element_meta)
-    linelists['null'] = (linelist[0][null_mask], linelist[1], linelist[2])
-    linelists['null'][2]['n_lines'] = np.count_nonzero(null_mask)
-    notify('Linelist loaded!'.format(linelist_dir), color = 'g')
+    if (loaded_linelist_path is None) or (loaded_linelist_path != linelist_dir):
+        # Load the master linelist into memory and split it by elements
+        notify('Loading linelist...'.format(linelist_dir), color = 'y')
+        f12, f19, meta = PyTLAS.load_linelist(linelist_dir) # Load the full linelist from disk
+        total_lines = len(f12)
+        linelists = {} # Dictionary for per-element linelists (+ the 'null' element for lines not associated with any elements)
+        # We now need to split f12 into per-element linelists. We have two strategies for doing it: in memory and on disk
+        if not settings['conserve_memory']:
+            null_mask = np.full(len(f12), True)
+            for element in settings['elements']:
+                element_mask = np.isin(f12['f3'], [code_to_nelion(code) for code in settings['elements'][element]])
+                element_meta = copy.deepcopy(meta)
+                element_meta['n_lines'] = np.count_nonzero(element_mask)
+                element_meta['n_lines_f19'] = 0
+                null_mask &= ~element_mask
+                linelists[element] = (f12[element_mask], f19[:0], element_meta)
+            linelists['null'] = (f12[null_mask], f19, meta)
+            linelists['null'][2]['n_lines'] = np.count_nonzero(null_mask)
+            del element_mask, null_mask
+        else:
+            # Load the full linelist and extract the NELION column while discarding everything else
+            nelion = np.zeros(len(f12), dtype = np.int32)
+            nelion[:] = f12['f3']
+            del f12
+            free_memory(False, False)
+            # Figure out which lines belong to which elements and allocate room for individual element linelists
+            masks = {'null': np.full(len(nelion), True)}
+            f12_dtype = 'V4,i4,f4,i4,f4,f4,f4,f4,f4,V4'
+            for element in settings['elements']:
+                masks[element] = np.isin(nelion, [code_to_nelion(code) for code in settings['elements'][element]])
+                masks['null'] &= ~masks[element]
+                element_meta = copy.deepcopy(meta)
+                element_meta['n_lines'] = np.count_nonzero(masks[element])
+                element_meta['n_lines_f19'] = 0
+                linelists[element] = (np.empty(element_meta['n_lines'], dtype = f12_dtype), f19[:0], element_meta)
+            del nelion
+            free_memory(False, False)
+            linelists['null'] = (np.empty(np.count_nonzero(masks['null']), dtype = f12_dtype), f19[:], copy.deepcopy(meta))
+            linelists['null'][2]['n_lines'] = len(linelists['null'][0])
+            # Now read the linelist again in small chunks and split them by element
+            f = open('{}/fort.12'.format(linelist_dir), 'rb')
+            pos = 0
+            element_pos = {element: 0 for element in linelists}
+            while True:
+                chunk = np.fromfile(f, dtype = f12_dtype, count = 10000)
+                if chunk.size == 0:
+                    break
+                for element in linelists:
+                    lines = chunk[masks[element][pos:pos + chunk.size]]
+                    linelists[element][0][element_pos[element]:element_pos[element] + lines.size] = lines
+                    element_pos[element] += lines.size
+                pos += chunk.size
+            f.close()
+            del masks, chunk, element_pos
+        loaded_linelist_path = linelist_dir
+        # Double check that the total number of lines matches the master linelist
+        if sum([len(linelists[element][0]) for element in linelists]) != total_lines:
+            raise ValueError('The elements defined in settings[\'elements\'] cannot share species!')
+        notify('Linelist loaded!'.format(linelist_dir), color = 'g')
+
+    free_memory(False, False)
 
     return grid
 
@@ -427,10 +478,6 @@ def read_grid_model(params, grid):
     of the null-spectrum corresponds to the stellar parameters at the grid point (zscale, alpha, carbon) as well as abundance
     offsets in `settings['initial_abundance_offsets']`. The null-opacities are the opacities due to individual elements (as
     defined in `settings['elements']` in the null-spectrum)
-
-    In order to handle redshift, the function will trim the wavelength range of the model spectrum on both sides to make sure
-    that the resulting wavelength range remains within the model coverage at all redshifts between the bounds in
-    `settings['virtual_dof']['redshift']`
 
     Parameters
     ----------
@@ -456,8 +503,8 @@ def read_grid_model(params, grid):
             structure: model atmosphere at this grid point as a Kurucz-formatted text file loaded as byte array
             null_xnfpelsyn: XNFPELSYN output of the null-spectrum, which most importantly includes continuum opacities of the
                             null-spectrum. We do not update continuum opacities when fitting response functions
-            null_spectrum: Full (without redshift trimming) null-spectrum, including the wavelength grid, the corresponding flux
-                           densities, continuum flux densities and the continuum-normalized flux
+            null_spectrum: Full null-spectrum, including the wavelength grid, the corresponding flux densities, continuum flux
+            densities and the continuum-normalized flux
     """
     global ATLAS_restarts_header, linelists, xnfpelsyn, spectrv, synthe
     model_indices = tuple([list(grid[param]).index(params[param]) for param in sorted(list(params.keys()))])
@@ -576,14 +623,23 @@ def read_grid_model(params, grid):
     meta['null_spectrum'] = spectrv.get_spectrum()
     notify('({}) Null-spectrum computed!'.format(model_indices), color = 'g')
 
-    # Trim the spectrum on both sides to make sure we can do redshift corrections
-    wl_range = [np.min(meta['null_spectrum'][0] * (1 + settings['virtual_dof']['redshift'][1] * 1e3 / scp.constants.c)), np.max(meta['null_spectrum'][0] * (1 + settings['virtual_dof']['redshift'][0] * 1e3 / scp.constants.c))]
-    mask_left = meta['null_spectrum'][0] < wl_range[0]; mask_right = meta['null_spectrum'][0] > wl_range[1]; mask_in = (~mask_left) & (~mask_right)
+    # Dump opacity tables to disk if requested
+    if settings['conserve_memory']:
+        f, path = tempfile.mkstemp(prefix = 'asynth_', suffix = '.pkl', dir = settings['scratch'])
+        os.close(f)
+        f = open(path, 'wb')
+        pickle.dump(meta['asynth'], f)
+        f.close()
+        del meta['asynth']
+        meta['asynth'] = path
 
-    return meta['null_spectrum'][0][mask_in], meta['null_spectrum'][3][mask_in], meta
+    # Clear memory
+    free_memory(False, False)
+
+    return meta['null_spectrum'][0], meta['null_spectrum'][3], meta
 
 def preprocess_grid_model(wl, flux, params, meta):
-    """Apply response functions and redshift corrections to a synthetic spectrum
+    """Apply response functions to a synthetic spectrum
 
     Response functions are calculated dynamically in real time. When the null-spectrum is first generated in `read_grid_model()`,
     a placeholder dictionary is defined in `meta` to store response functions. This function determines which response functions
@@ -593,19 +649,19 @@ def preprocess_grid_model(wl, flux, params, meta):
     Parameters
     ----------
     wl : array_like
-        Grid of model wavelengths in A (trimmed to accommodate all redshifts)
+        Grid of model wavelengths in A
     flux : array_like
-        Corresponding flux densities. This flux array is however unused, as it is immediately replaced by the full (without
-        redshift trimming) flux array stored in `meta`
+        Corresponding flux densities. This flux array is however unused, as it is immediately replaced by the flux array stored
+        in `meta`
     params : dict
-        Parameters of the model, including desired chemical abundances to be reproduced with response functions, and redshift
+        Parameters of the model, including desired chemical abundances to be reproduced with response functions
     meta : dict
         Null-spectrum, null-opacities, already computed response functions and other data, as defined in `read_grid_model()`
 
     Returns
     -------
     array_like
-        Redshifted flux density with applied response functions
+        Flux density vector with applied response functions
     """
     global ATLAS_restarts_header, linelists, xnfpelsyn, spectrv, synthe
 
@@ -631,6 +687,14 @@ def preprocess_grid_model(wl, flux, params, meta):
         if type(meta['response'][response[0]][response[1]]) is bool:
             to_compute += [response]
 
+    # Load opacity tables from disk if that's where they are
+    if settings['conserve_memory']:
+        f = open(meta['asynth'], 'rb')
+        asynth = pickle.load(f)
+        f.close()
+    else:
+        asynth = meta['asynth']
+
     # Calculate the missing response functions
     if len(to_compute) != 0:
         notify('({}) Computing {} response function{} ({})'.format(meta['model_indices'], len(to_compute), ['', 's'][int(len(to_compute) > 1)], ','.join(['{}={}'.format(*response) for response in to_compute])), color = 'y')
@@ -646,7 +710,7 @@ def preprocess_grid_model(wl, flux, params, meta):
             synthe.load_xnfpelsyn(xnfpelsyn)
             synthe.load_linelist(*linelists[response[0]], VTURB_LOGG(params['logg']))
             synthe.run()
-            synthe.asynth[meta['element_masks'][response[0]]] += meta['asynth']['null'][meta['element_masks'][response[0]]] - meta['asynth'][response[0]]
+            synthe.asynth[meta['element_masks'][response[0]]] += asynth['null'][meta['element_masks'][response[0]]] - asynth[response[0]]
             # Reset the output of XNFPELSYN so we use the null-spectrum continuum in all response functions
             for field in meta['null_xnfpelsyn']:
                 xnfpelsyn.xnfpelsyn_output[field][...] = meta['null_xnfpelsyn'][field]
@@ -657,6 +721,10 @@ def preprocess_grid_model(wl, flux, params, meta):
             spectrum = spectrv.get_spectrum()
             meta['response'][response[0]][response[1]] = spectrum[3] - flux[meta['element_masks'][response[0]]]
         notify('({}) Response functions computed!'.format(meta['model_indices']), color = 'g')
+
+    if settings['conserve_memory']:
+        del asynth
+        free_memory(False, False)
 
     # Assemble the spectrum
     for element in settings['elements']:
@@ -670,11 +738,6 @@ def preprocess_grid_model(wl, flux, params, meta):
 
     # Apply continuum
     flux *= meta['null_spectrum'][2]
-
-    # Apply redshift
-    wl_full = meta['null_spectrum'][0]
-    wl_redshifted = wl_full * (1 + params['redshift'] * 1e3 / scp.constants.c)
-    flux = np.interp(wl, wl_redshifted, flux)
 
     return flux
 
@@ -715,7 +778,7 @@ def extract_results(fit, propagate_gridfit = False, detector_wl = False):
                       is `True`
             cov     : covariance matrix from the Jacobian. Only provided if `propagate_gridfit` is `True`
     """
-    global ATLAS_restarts_header, linelists, xnfpelsyn, spectrv, synthe
+    global ATLAS_restarts_header, linelists, xnfpelsyn, spectrv, synthe, loaded_linelist_path
 
     # Re-express all abundances with respect to hydrogen
     fit['extra']['abun'] = {'abun': {}, 'errors': {}}
@@ -745,11 +808,15 @@ def extract_results(fit, propagate_gridfit = False, detector_wl = False):
             notify('Computing derivative{} in {}'.format(['', 's'][int(len(added_dof) > 1)], ','.join(added_dof)), color = 'y')
 
             # Generate the all-inclusive line list
-            f12 = np.concatenate([linelists[element][0] for element in linelists])
-            f19 = np.concatenate([linelists[element][1] for element in linelists])
-            meta = copy.deepcopy(linelists['null'][2])
-            meta['n_lines'] = len(f12)
-            meta['n_lines_f19'] = len(f19)
+            if not settings['conserve_memory']:
+                f12 = np.concatenate([linelists[element][0] for element in linelists])
+                f19 = np.concatenate([linelists[element][1] for element in linelists])
+                meta = copy.deepcopy(linelists['null'][2])
+                meta['n_lines'] = len(f12)
+                meta['n_lines_f19'] = len(f19)
+            else:
+                f12, f19, meta = PyTLAS.load_linelist(loaded_linelist_path)
+            free_memory(True, False)
 
             for dof in ['nominal'] + added_dof:
                 params = {param: fit['fit'][param] for param in settings['gridfit_params']}
@@ -822,13 +889,33 @@ def extract_results(fit, propagate_gridfit = False, detector_wl = False):
 
     return fit
 
-def free_memory(clear_linelist):
-    global linelists, synthe, spectrv
+def free_memory(clear_linelist, clear_PyTLAS = True):
+    """Helper function to de-allocate memory associated with PyTLAS and release it to the operating system once a
+    `chemfit.chemfit()` fitting run is done
+    
+    In this context, "memory associated with PyTLAS" refers to all of the global variables that are used to
+    interface with PyTLAS Fortran libraries, including `linelists`, `synthe` and `spectrv`
 
-    del synthe.f12, synthe.f19, synthe.meta, synthe.asynth, synthe.xnfpelsyn_output
-    del spectrv.meta, spectrv.xnfpelsyn_output, spectrv.asynth, spectrv.spectrum
+    After deleting the relevant variables, this function both dispatches the Python garbage collector, and also runs
+    glibc's `malloc_trim()` routine, as it is sometimes necessary to fully release garbage-collected memory
+    
+    Parameters
+    ----------
+    clear_linelist : bool
+        If `True`, remove the linelist from memory. If the linelist is going to be reused later (e.g. by the next
+        iteration of LOCALFIT), set to `False`
+    clear_PyTLAS : bool, optional
+        If `True`, remove data bound to the global `synthe` and `spectrv` variables, which includes opacity tables,
+        chemical equilibrium tables, synthetic spectra and meta data
+    """
+    global linelists, synthe, spectrv, loaded_linelist_path
+
+    if clear_PyTLAS:
+        del synthe.f12, synthe.f19, synthe.meta, synthe.asynth, synthe.xnfpelsyn_output
+        del spectrv.meta, spectrv.xnfpelsyn_output, spectrv.asynth, spectrv.spectrum
     if clear_linelist:
         del linelists
+        loaded_linelist_path = None
 
     gc.collect()
     libc = ctypes.CDLL('libc.so.6')
@@ -853,9 +940,7 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
     ivar : dict
         Spectrum weights (inverted variances) keyed by spectrograph arm
     gridfit : dict
-        Stellar parameters of the spectrum (required keys are 'teff', 'logg', 'zscale', 'alpha' and 'carbon') and
-        the initial values for all virtual degrees of freedom that are not the abundances of individual elements
-        (for now, it is just redshift)
+        Stellar parameters of the spectrum (required keys are 'teff', 'logg', 'zscale', 'alpha' and 'carbon')
     initial_abundance_offsets : dict, optional
         Dictionary of initial abundance offsets from the zscale+alpha+carbon nominal chemistry to be used in the
         fitter. The keys must only include elements from `settings['elements']`. Defaults to no offsets
@@ -868,11 +953,10 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
             3 : Same as level 1, but repeat the abundance determination `niter` times,
                 updating the abundances of the null-spectrum to the output of the previous
                 iteration
-            4 : Same as level 3, but compute new model atmospheres instead of interpolating the grid
-            5 : Same as level 4, but recompute the model atmospheres at the end of each
+            4 : Same as level 3, but recompute the model atmospheres at the end of each
                 iteration with the determined abundances
     niter : number, optional
-        Number of iterations to carry out. Only relevant if the analysis level is 3, 4 or 5
+        Number of iterations to carry out. Only relevant if the analysis level is 3 or 4
     Returns
     -------
     dict
@@ -883,18 +967,16 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
     """
     # Check that all basegrid parameters and all virtual parameters are present in `gridfit`
     basegrid_dof = ['teff', 'logg', 'zscale', 'alpha', 'carbon']
-    required = basegrid_dof + [param for param in settings['virtual_dof'] if param not in settings['elements']]
-    if set(required) != gridfit.keys():
-        raise ValueError('Provided gridfit parameters {} do not match the requirement {}'.format(list(gridfit.keys()), required))
+    stellar_parameters = {param: gridfit[param] for param in basegrid_dof + [param for param in settings['virtual_dof'] if param not in settings['elements']]}
 
-    if level not in [1, 2, 3, 4, 5]:
+    if level not in [1, 2, 3, 4]:
         raise ValueError('Unknown analysis level {}'.format(level))
 
-    settings['gridfit_params'] = {param: gridfit[param] for param in basegrid_dof}
-    settings['compute_new_structure'] = level in [2, 4, 5]
+    settings['gridfit_params'] = {param: stellar_parameters[param] for param in basegrid_dof}
+    settings['compute_new_structure'] = level in [2, 4]
     settings['initial_abundance_offsets'] = {}
-    settings['use_initial_abundance_offsets_in_structure'] = level in [2, 4, 5]
-    settings['fit_dof'] = [param for param in settings['gridfit_offsets'] if len(settings['gridfit_offsets'][param]) > 1] + ['redshift'] + [element for element in settings['elements']]
+    settings['use_initial_abundance_offsets_in_structure'] = level in [2, 4]
+    settings['fit_dof'] = [param for param in settings['gridfit_offsets'] if len(settings['gridfit_offsets'][param]) > 1] + [element for element in settings['elements']]
 
     # Apply initial offsets
     for element in initial_abundance_offsets:
@@ -904,20 +986,24 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
             raise ValueError('Element {} in initial abundance offsets exceeds the allowed range'.format(element))
         settings['initial_abundance_offsets'][element] = initial_abundance_offsets[element]
 
-    params = {**gridfit, **settings['initial_abundance_offsets']}
+    params = {**stellar_parameters, **settings['initial_abundance_offsets']}
     intermediate = [] # Storage for intermediate abundances at the end of each iteration
 
-    actual_niter = [1, niter][level in [3, 4, 5]]
+    actual_niter = [1, niter][level in [3, 4]]
     for iteration in range(actual_niter):
         notify('*** Starting iteration {} ***'.format(iteration + 1), color = 'm')
         fit = main__chemfit(wl, flux, ivar, initial = params, method = ['gradient_descent', 'gradient_descent+jac'][int(iteration == actual_niter - 1)])
+        if settings['conserve_memory']:
+            to_delete = glob.glob('{}/asynth_*.pkl'.format(settings['scratch']))
+            for filename in to_delete:
+                os.remove(filename)
         if iteration != actual_niter - 1:
-            free_memory(True)
+            free_memory(False)
             for element in settings['elements']:
                 settings['initial_abundance_offsets'][element] = fit['fit'][element]
             for param in settings['fit_dof']:
                 params[param] = fit['fit'][param]
-            settings['use_initial_abundance_offsets_in_structure'] = level == 5
+            settings['use_initial_abundance_offsets_in_structure'] = level == 4
         else:
             free_memory(False)
         fit = extract_results(fit, propagate_gridfit = False)
@@ -928,6 +1014,5 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
     fit = extract_results(fit, propagate_gridfit = True, detector_wl = wl)
     free_memory(True)
     fit['extra']['abun']['intermediate'] = intermediate
-    del fit['extra']['jac']
 
     return fit

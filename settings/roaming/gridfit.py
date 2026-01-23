@@ -29,11 +29,17 @@ settings = {
     ### Model grid settings ###
     'grid_filename': original_settings['grid_filename'],    # Model directory must be specified in local settings
 
+    ### Spacing between trial redshifts when redshift search is requested in public__gridfit() ###
+    'redshift_search_spacing': 50,
+
+    ### Maximum absolute shifts in best-fit parameters between iterations at convergence ###
+    'conv_shifts': {'teff': 1, 'logg': 0.01, 'zscale': 0.01, 'alpha': 0.01, 'carbon': 0.01},
+
     ### Which parameters to fit for? All dimensions of the grid + redshift ###
     'fit_dof': ['zscale', 'alpha', 'teff', 'logg', 'carbon', 'redshift'],
 
     ### Bounds for virtual parameters, i.e. parameters that are not dimensions of the grid ###
-    'virtual_dof': {'redshift': [-300, 300]},
+    'virtual_dof': {'redshift': [-500, 500]},
 
     ### Default initial guesses ###
     'default_initial': {'redshift': 0.0},
@@ -200,17 +206,19 @@ def public__get_carbon_wrt_solar(params):
     # Run the conversion
     return params['carbon'] + carbon_map([params['zscale'], params['logg']])[0]
 
-def public__chemfit_phot(wl, flux, ivar, initial, phot, max_iter = 20):
-    """Determine the stellar parameters of a star given a combination of its spectrum and photometry,
-    such that the effective temperature is determined purely photometrically and the other parameters
-    are determined purely spectroscopically
+def public__gridfit(wl, flux, ivar, initial = {}, phot = {}, separate_redshift = True, search_redshift = False, max_iter = 20):
+    """Determine the stellar parameters and redshift (radial velocity) of a star from its spectrum and
+    (optionally) its photometry
 
-    This function is a wrapper of chemfit.chemfit(). The fit is carried out iteratively. Each iteration
-    consists of photometric and spectroscopic steps. During the photometric step, all parameters except
-    "teff" are fixed, and the photometric priors are used to determine "teff". At the spectroscopic step,
-    only "teff" is fixed, and the rest of the parameters are determined using the spectrum alone.
-    Iterations continue either until `max_iter` is reached, or until "teff" converges
-    
+    When photometry is provided, the fit is carried out iteratively such that the effective temperature
+    is determined purely from photometry, and all other parameters are determined purely from the
+    spectrum. The function also provides the ability to assign distinct redshifts to individual arms of
+    the spectrograph to handle inconsistent wavelength calibration between the arms
+
+    Spectral fitting tends to be sensitive to the initial redshift guess. The function provides the
+    ability to run the preliminary fit multiple times with different initial redshifts in order to
+    ensure convergence
+
     Parameters
     ----------
     wl : dict
@@ -220,59 +228,149 @@ def public__chemfit_phot(wl, flux, ivar, initial, phot, max_iter = 20):
     ivar : dict
         Spectrum weights (inverted variances) keyed by spectrograph arm
     initial : dict
-        Initial guesses for the stellar parameters, keyed by parameter. Each parameter supported
-        by the model grid must be listed, except those for which default initial guesses are defined
-        in `settings['default_initial']`
+        Initial guesses for the stellar parameters, keyed by parameter. Default initial guesses will
+        be used for unspecified parameters (see `default`). If `search_redshift` is `False`, then an
+        initial guess of redshift is mandatory. Note that statistical priors are not supported by `gridfit()`
+        (use `chemfit()` instead)
     phot : dict, optional
-        Photometric colors of the star (mandatory). The colors and the spectrum will be fit to
-        the models simultaneously to attain stricter constraints on the stellar parameters. Each
-        color is keyed by `BAND1#BAND2`, where `BAND1` and `BAND2` are the transmission profile
-        filenames of the filters, as required by `synphot()`. Each element is a 2-element tuple,
-        where the first element is the measured color, and the second element is the uncertainty
-        in the measurement. The dictionary may also include optional elements `reddening` (E(B-V),
-        single numerical value), and `mag_system` (one of the magnitude systems supported by
+        Photometric colors of the star. Each color is keyed by `BAND1#BAND2`, where `BAND1` and `BAND2`
+        are the transmission profile filenames of the filters, as required by `synphot()`. Each element
+        is a 2-element tuple, where the first element is the measured color, and the second element is the
+        uncertainty in the measurement. The dictionary may also include optional elements `reddening`
+        (E(B-V), single numerical value), and `mag_system` (one of the magnitude systems supported by
         `synphot()`, single string)
-    max_iter : int
-        Maximum number of iterations to carry out
-    
+    separate_redshift : bool, optional
+        If enabled, separate redshifts will be determined for each arm of the spectrograph. Otherwise,
+        all arms will be forced to have the same redshift
+    search_redshift : bool, optional
+        If enabled, the function will try a multitude of initial redshift guesses across the entire allowed
+        range (given by `settings['virtual_dof']['redshift']`) in steps given by
+        `settings['redshift_search_spacing']`. While this approach is more likely to produce the best final
+        result, it can be computationally demanding. Alternatively, this option may be disabled, in which
+        case a good redshift guess must be provided in `initial`
+    max_iter : number, optional
+        Maximum number of refinement iterations, which are used to process photometric priors and/or separate
+        arm redshifts. The fitter may carry out fewer iterations than this maximum value if good convergence
+        of parameters is attained
+
     Returns
     -------
     dict
-        The format of the output is identical to that of `chemfit.chemfit()`
+        The format of the output is similar to `chemfit.chemfit()`, except the best-fit redshift values
+        (`['fit']['redshift']`) are provided as a dictionary keyed by spectrograph arms instead of a singular
+        value. If `separate_redshift` is `True`, the priliminary best-fit parameters obtained from the spectra
+        of individual arms are stored in `['extra']['fit_individual']`. The final rest frame wavelength vectors
+        (keyed by spectrograph arms) are provided in `['extra']['rest_wl']`
     """
-    # Check that the required parameters are in place and photometric priors have been provided
-    if 'teff' not in settings['fit_dof']:
-        raise ValueError('teff must be included in settings[\'fit_dof\'] to use chemfit_phot()')
-    if len(settings['fit_dof']) == 1:
-        raise ValueError('At least one non-teff parameter must be included in settings[\'fit_dof\'] to use chemfit_phot()')
-    if len([color for color in phot if len(color.split('#')) == 2]) == 0:
-        raise ValueError('chemfit_phot() requires photometric priors')
+    extra = {}
 
-    # Run all-parameter fit first to get the initial position
-    notify('Running initial fit...')
-    fit = main__chemfit(wl, flux, ivar, initial = initial, phot = phot)
+    # Process initial guesses
+    default = {'teff': 4000, 'logg': 1.5, 'zscale': -1.0, 'alpha': 0.0, 'carbon': 0.0}
+    initial = {**default, **initial}
+    if not search_redshift:
+        if 'redshift' not in initial:
+            raise ValueError('Initial redshift must be either specified or the redshift search must be enabled (gridfit(..., search_redshift=True))')
+        redshift_trials = [initial['redshift']]
+    else:
+        if 'redshift' not in settings['fit_dof']:
+            raise ValueError('redshift must be included in settings[\'fit_dof\'] to use gridfit(..., search_redshift=True)')
+        redshift_trials = np.arange(*settings['virtual_dof']['redshift'], settings['redshift_search_spacing'])[1:]
+    if np.any([np.ndim(initial[param]) > 0 for param in initial]):
+        raise ValueError('Statistical priors are not supported in gridfit()')
+
+    if len(phot) > 0 and 'teff' not in settings['fit_dof']:
+        raise ValueError('teff must be included in settings[\'fit_dof\'] to use photometric priors')
+
+    # Get preliminary redshifts and stellar parameters as a starting point for iterative refinements
+    if separate_redshift:
+        if 'redshift' not in settings['fit_dof']:
+            raise ValueError('redshift must be included in settings[\'fit_dof\'] to use gridfit(..., separate_redshift=True)')
+        notify('Calculating preliminary redshifts for individual arms...')
+        extra['fit_individual'] = {}
+        redshift = {}
+        for arm in wl:
+            redshift[arm] = (0.0, np.inf)
+            for redshift_trial in redshift_trials:
+                fit = main__chemfit({arm: wl[arm]}, {arm: flux[arm]}, {arm: ivar[arm]}, initial = {**initial, 'redshift': redshift_trial}, phot = phot)
+                if 'redshift' not in fit['errors']:
+                    redshift[arm] = (fit['fit']['redshift'], np.nan)
+                    extra['fit_individual'][arm] = {'fit': fit['fit'], 'errors': fit['errors']}
+                elif fit['errors']['redshift'] < redshift[arm][1]:
+                    redshift[arm] = (fit['fit']['redshift'], fit['errors']['redshift'])
+                    extra['fit_individual'][arm] = {'fit': fit['fit'], 'errors': fit['errors']}
+            notify('Redshift in {} = {:.3f} ± {:.3f}'.format(arm, *redshift[arm]), color = 'g')
+        notify('Calculating preliminary combined fit...')
+        rest_wl = {arm: wl[arm] / (1 + redshift[arm][0] * 1e3 / scp.constants.c) for arm in wl}
+        fit = main__chemfit(rest_wl, flux, ivar, initial = {**initial, 'redshift': 0.0}, phot = phot, dof = list(set(settings['fit_dof']) - {'redshift'}))
+        result = {param: fit['fit'][param] for param in default}
+    else:
+        notify('Calculating preliminary fit...')
+        redshift = (0.0, np.inf)
+        for redshift_trial in redshift_trials:
+            fit = main__chemfit(wl, flux, ivar, initial = {**initial, 'redshift': redshift_trial}, phot = phot)
+            if 'redshift' not in fit['errors']:
+                redshift = (fit['fit']['redshift'], np.nan)
+                result = {param: fit['fit'][param] for param in default}
+            elif fit['errors']['redshift'] < redshift[1]:
+                redshift = (fit['fit']['redshift'], fit['errors']['redshift'])
+                result = {param: fit['fit'][param] for param in default}
+        notify('Redshift = {:.3f} ± {:.3f}'.format(*redshift), color = 'g')
+        redshift = {arm: redshift for arm in wl}
+    notify('Preliminary fit computed: {}'.format({key: np.round(result[key], 3) for key in result}), color = 'g')
 
     # Blank flux for purely photometric fits
     blank_flux = {arm: np.full(len(flux[arm]), np.nan) for arm in flux}
 
-    for iter in range(max_iter):
-        notify('Starting iteration {}'.format(iter))
+    is_phot_step = len(phot) > 0 and 'teff' in settings['fit_dof'] # Do we need photometric steps
+    # Which parameters to fit for in the spectroscopic step
+    spec_step_params = set(settings['fit_dof'])
+    if is_phot_step:
+        spec_step_params -= {'teff'}
+    if separate_redshift:
+        spec_step_params -= {'redshift'}
+    spec_step_params = list(spec_step_params)
 
-        # Re-determine teff from pure photometry
-        fit = main__chemfit(wl, blank_flux, ivar, initial = fit['fit'], phot = phot, dof = ['teff'])
-        notify('Photometric step: {}'.format(fit['fit']), color = 'c')
+    # Carry out iterative refinements
+    for n_iter in range(max_iter):
+        notify('Starting iteration {}'.format(n_iter + 1))
 
-        # Re-determine other parameters from pure spectra
-        fit = main__chemfit(wl, flux, ivar, initial = fit['fit'], dof = [param for param in settings['fit_dof'] if param != 'teff'])
-        notify('Spectroscopic step: {}'.format(fit['fit']), color = 'm')
+        rest_wl = {arm: wl[arm] / (1 + redshift[arm][0] * 1e3 / scp.constants.c) for arm in wl}
 
-        if iter != 0 and np.abs(fit['fit']['teff'] - prev_teff) < 0.1:
-            notify('Teff converged', color = 'g')
+        prev = copy.deepcopy(result)
+
+        # Photometric step (teff only)
+        if is_phot_step:
+            fit = main__chemfit(rest_wl, blank_flux, ivar, initial = {**result, 'redshift': 0}, phot = phot, dof = ['teff'])
+            result = {param: fit['fit'][param] for param in default}
+            notify('Photometric step: {}, redshift: {}'.format({key: np.round(result[key], 3) for key in result}, {key: np.round(redshift[key][0], 3) for key in redshift}), color = 'c')
+
+        # Spectroscopic step
+        fit = main__chemfit(rest_wl, flux, ivar, initial = {**result, 'redshift': 0}, dof = spec_step_params)
+        result = {param: fit['fit'][param] for param in default}
+        if 'redshift' in fit['errors']:
+            redshift = {arm: (redshift[arm][0] + fit['fit']['redshift'], fit['errors']['redshift']) for arm in wl}
+        notify('Spectroscopic step: {}, redshift: {}'.format({key: np.round(result[key], 3) for key in result}, {key: np.round(redshift[key][0], 3) for key in redshift}), color = 'c')
+
+        # Redshift step
+        if separate_redshift:
+            for arm in wl:
+                fit = main__chemfit({arm: rest_wl[arm]}, {arm: flux[arm]}, {arm: ivar[arm]}, initial = {**result, 'redshift': 0}, dof = ['redshift'])
+                redshift[arm] = (redshift[arm][0] + fit['fit']['redshift'], fit['errors']['redshift'])
+            notify('Redshift step: {}, redshift: {}'.format({key: np.round(result[key], 3) for key in result}, {key: np.round(redshift[key][0], 3) for key in redshift}), color = 'c')
+
+        # Evaluate convergence
+        if np.all([np.abs(prev[param] - result[param]) <= settings['conv_shifts'][param] for param in settings['conv_shifts']]):
+            notify('Stellar parameters have converged', color = 'g')
             break
-        prev_teff = fit['fit']['teff']
+        elif n_iter == max_iter - 1:
+            notify('Maximum number of iterations reached', color = 'r')
 
-    # Get the final covariance matrix
+    # Get the final uncertainties and the fit object
     notify('Calculating covariance matrix...')
-    fit = main__chemfit(wl, flux, ivar, initial = fit['fit'], phot = phot, method = 'cov')
+    rest_wl = {arm: wl[arm] / (1 + redshift[arm][0] * 1e3 / scp.constants.c) for arm in wl}
+    extra['rest_wl'] = rest_wl
+    fit = main__chemfit(rest_wl, flux, ivar, initial = {**result, 'redshift': 0}, phot = phot, method = 'cov')
+    fit['fit']['redshift'] = {arm: redshift[arm][0] for arm in redshift}
+    fit['extra'].update(extra)
 
     return fit

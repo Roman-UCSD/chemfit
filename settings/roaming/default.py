@@ -49,7 +49,6 @@ settings = {
     'mcmc': {
         'nwalkers': 32,
         'nsteps': 5000,
-        'discard': 300,
         'initial': 'gradient_descent',
         'progress': True,
     },
