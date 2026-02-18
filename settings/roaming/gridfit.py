@@ -12,6 +12,7 @@
 import h5py
 import pickle
 import scipy as scp
+import gc, ctypes
 
 if 'grid_filename' not in original_settings:
     raise ValueError('You must create a local settings preset (settings/local/gridfit.py) that defines the "grid_filename" key to point to the model grid HDF5 file')
@@ -55,6 +56,10 @@ settings = {
 def main__chemfit():
     pass
 
+# Reference to chemfit.flush_convolution_weights_cache() which will be populated when this preset is initialized
+def main__flush_convolution_weights_cache():
+    pass
+
 _global = {}
 
 def notify(message, color = 'k'):
@@ -76,6 +81,17 @@ def notify(message, color = 'k'):
     if not settings['silent']:
         print(prefix + message + suffix, flush = True)
 
+def free_memory():
+    """Helper function to de-allocate memory in between chemfit runs
+
+    This function both dispatches the Python garbage collector, and also runs glibc's `malloc_trim()` routine, as it is sometimes
+    necessary to fully release garbage-collected memory
+    """
+    gc.collect()
+    libc = ctypes.CDLL('libc.so.6')
+    libc.malloc_trim(0)
+    return
+
 def read_grid_dimensions():
     """Determine the available dimensions in the model grid and the grid points
     available in those dimensions
@@ -90,20 +106,25 @@ def read_grid_dimensions():
     """
     global _global
 
+    # Check if the grid has already been loaded
+    if ('grid_filename' in _global) and (_global['grid_filename'] == settings['grid_filename']):
+        return _global['grid']
+
     # Load the grid from the HDF5 header
     with h5py.File(settings['grid_filename'], 'r') as f:
         header = pickle.loads(bytes(f['header'][()]))
-    grid = {'teff': header['teff'], 'logg': header['logg'], 'zscale': header['zscale'], 'alpha': header['alpha'], 'carbon': header['carbon']}
-    for key in grid:
-        grid[key] = np.array(grid[key])
+    _global['grid_filename'] = settings['grid_filename']
+    _global['grid'] = {'teff': header['teff'], 'logg': header['logg'], 'zscale': header['zscale'], 'alpha': header['alpha'], 'carbon': header['carbon']}
+    for key in _global['grid']:
+       _global['grid'][key] = np.array(_global['grid'][key])
 
     # Prepare a map of grid points to indices for quick lookup
-    _global['index_map'] = {param: {value: i for i, value in enumerate(grid[param])} for param in grid}
+    _global['index_map'] = {param: {value: i for i, value in enumerate(_global['grid'][param])} for param in _global['grid']}
 
     # Load the wavelength grid
     _global['wl'] = header['wl']
 
-    return grid
+    return _global['grid']
 
 def read_grid_model(params, grid):
     """Load a specific model spectrum from the model grid
@@ -145,6 +166,20 @@ def read_grid_model(params, grid):
     meta = {'left': [wl[mask_left], flux[mask_left]], 'right': [wl[mask_right], flux[mask_right]]}
 
     return wl[mask_in], flux[mask_in], meta
+
+def delete_grid_model(meta):
+    """This function does nothing
+
+    Normally this function is used to safely delete model data; however, in the GRIDFIT
+    mode, the models do not contain any data that will not be deleted by the garbage
+    collector, so we do not do anything here
+
+    Parameters
+    ----------
+    meta : dict
+        Dictionary with additional model data, as loaded by `read_grid_model()`
+    """
+    return
 
 def preprocess_grid_model(wl, flux, params, meta):
     """Apply redshift correction
@@ -301,7 +336,8 @@ def public__gridfit(wl, flux, ivar, initial = {}, phot = {}, separate_redshift =
             notify('Redshift in {} = {:.3f} ± {:.3f}'.format(arm, *redshift[arm]), color = 'g')
         notify('Calculating preliminary combined fit...')
         rest_wl = {arm: wl[arm] / (1 + redshift[arm][0] * 1e3 / scp.constants.c) for arm in wl}
-        fit = main__chemfit(rest_wl, flux, ivar, initial = {**initial, 'redshift': 0.0}, phot = phot, dof = list(set(settings['fit_dof']) - {'redshift'}))
+        main__flush_convolution_weights_cache() # Remove the calculated convolution weights as we no longer need them since the wavelength grid changed
+        fit = main__chemfit(rest_wl, flux, ivar, initial = {**initial, 'redshift': 0.0}, phot = phot, dof = sorted(list(set(settings['fit_dof']) - {'redshift'})))
         result = {param: fit['fit'][param] for param in default}
     else:
         notify('Calculating preliminary fit...')
@@ -328,13 +364,14 @@ def public__gridfit(wl, flux, ivar, initial = {}, phot = {}, separate_redshift =
         spec_step_params -= {'teff'}
     if separate_redshift:
         spec_step_params -= {'redshift'}
-    spec_step_params = list(spec_step_params)
+    spec_step_params = sorted(list(spec_step_params))
 
     # Carry out iterative refinements
     for n_iter in range(max_iter):
         notify('Starting iteration {}'.format(n_iter + 1))
 
         rest_wl = {arm: wl[arm] / (1 + redshift[arm][0] * 1e3 / scp.constants.c) for arm in wl}
+        main__flush_convolution_weights_cache()
 
         prev = copy.deepcopy(result)
 
@@ -368,8 +405,11 @@ def public__gridfit(wl, flux, ivar, initial = {}, phot = {}, separate_redshift =
     # Get the final uncertainties and the fit object
     notify('Calculating covariance matrix...')
     rest_wl = {arm: wl[arm] / (1 + redshift[arm][0] * 1e3 / scp.constants.c) for arm in wl}
+    main__flush_convolution_weights_cache()
     extra['rest_wl'] = rest_wl
+    extra['gridfit_n_iter'] = n_iter + 1
     fit = main__chemfit(rest_wl, flux, ivar, initial = {**result, 'redshift': 0}, phot = phot, method = 'cov')
+    free_memory()
     fit['fit']['redshift'] = {arm: redshift[arm][0] for arm in redshift}
     fit['extra'].update(extra)
 

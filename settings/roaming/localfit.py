@@ -124,12 +124,12 @@ settings = {
     # Allow parallel calculation of ODFs (only relevant if 'compute_new_structure' is `True`)
     'ODF_multithreading': False,
 
-    # We want to cache all calculated models so that the null-spectra and opacities can be reused once calculated
-    'max_model_cache': 99999,
-
     # If True, chemfit will prioritize low memory usage over performance by storing opacity tables on disk and avoiding running
     # operations on the entire linelist
     'conserve_memory': False,
+
+    # If True, delete all linelists, ODFs and structures created in the scratch directory at the end of the run
+    'clean_scratch': True,
 
     # Scratch directory to store atmospheric structures and linelists. Must be specified in the local settings preset
     'scratch': original_settings['scratch'],
@@ -158,6 +158,9 @@ VTURB_LOGG = lambda logg: 2.792 * np.exp(-0.241 * logg -0.118)
 # Global variables to store the linelists and the path to the master linelist on disk
 linelists = {}
 loaded_linelist_path = None
+
+# Global variable to track all directories created by LOCALFIT in the scratch space
+scratch_files = []
 
 # Global variable to store the header of the ATLAS restart database
 ATLAS_restarts_header = atlas.restarts.load_header()
@@ -276,6 +279,24 @@ def code_to_nelion(code):
             raise ValueError('Species {} is not supported by XNFPELSYN/SYNTHE'.format(code))
     return nelion
 
+def delete_grid_model(meta):
+    """Remove the disk cache of opacity tables when the model is being deleted
+
+    This function is invoked whenever a spectral model loaded by ModelGridInterpolator() is deleted either because the maximum number of stored
+    models is exceeded (`settings['max_model_cache']`) or because the entire ModelGridInterpolator() object is being garbage collected
+
+    Here we want to ensure that, when opacity tables are stored on disk (which would normally be the case in memory conservation mode,
+    `settings['conserve_memory'] == True`), the file where they are stored is deleted whenever the model is deleted
+
+    Parameters
+    ----------
+    meta : dict
+        Dictionary with additional model data, as loaded by `read_grid_model()`
+    """
+    if ('asynth' in meta) and (type(meta['asynth']) is str) and os.path.isfile(meta['asynth']):
+        os.remove(meta['asynth'])
+    return
+
 def build_BasicATLAS_linelist(output_dir, wl_start, wl_end, res, C12C13, atoms, air_wl):
     """Compile a SYNTHE-formatted linelist for spectral synthesis using the internal machinery of BasicATLAS. The metadata of the linelist also
     fixes the wavelength sampling to be used in spectral synthesis. Isotope abundance ratios are fixed at this stage as well, as SYNTHE itself
@@ -374,7 +395,7 @@ def read_grid_dimensions():
         Placeholder grid points. Each element corresponds to a grid dimension (e.g. teff, logg etc), and the values are lists that
         contain the central value and the offset values
     """
-    global ATLAS_restarts_header, linelists, loaded_linelist_path
+    global ATLAS_restarts_header, linelists, loaded_linelist_path, scratch_files
 
     # Check that the GRIDFIT stellar parameters are fully specified
     if (type(settings['gridfit_params']) is bool) or (settings['gridfit_params'].keys() != set(['teff', 'logg', 'zscale', 'alpha', 'carbon'])):
@@ -402,6 +423,7 @@ def read_grid_dimensions():
         notify('Compiling linelist in {}'.format(linelist_dir), color = 'y')
         try:
             build_BasicATLAS_linelist(linelist_dir, settings['wl_start'], settings['wl_end'], settings['res'], C12C13, settings['atoms'], settings['air_wl'])
+            scratch_files += [linelist_dir]
         except:
             shutil.rmtree(linelist_dir)
             raise
@@ -506,7 +528,7 @@ def read_grid_model(params, grid):
             null_spectrum: Full null-spectrum, including the wavelength grid, the corresponding flux densities, continuum flux
             densities and the continuum-normalized flux
     """
-    global ATLAS_restarts_header, linelists, xnfpelsyn, spectrv, synthe
+    global ATLAS_restarts_header, linelists, xnfpelsyn, spectrv, synthe, scratch_files
     model_indices = tuple([list(grid[param]).index(params[param]) for param in sorted(list(params.keys()))])
 
     # Generate the ATLAS settings object for the structure model
@@ -542,6 +564,7 @@ def read_grid_model(params, grid):
             notify('({}) Calculating ODF in {}'.format(model_indices, ODF_dir), color = 'y')
             try:
                 atlas.dfsynthe(ODF_dir, settings = ATLAS_settings, parallel = settings['ODF_multithreading'], silent = True)
+                scratch_files += [ODF_dir]
             except:
                 shutil.rmtree(ODF_dir)
                 raise
@@ -549,6 +572,7 @@ def read_grid_model(params, grid):
         notify('({}) Calculating model atmosphere in {}'.format(model_indices, structure_dir), color = 'y')
         try:
             atlas.atlas(structure_dir, settings = ATLAS_settings, ODF = ODF_dir, silent = True)
+            scratch_files += [structure_dir]
         except:
             shutil.rmtree(structure_dir)
             raise
@@ -581,6 +605,7 @@ def read_grid_model(params, grid):
         f = open('{}/output_summary.out'.format(structure_dir), 'w'); f.write(model); f.close()
         f = open('{}/output_last_iteration.out'.format(structure_dir), 'w'); f.close()
         f = open('{}/output_main.out'.format(structure_dir), 'w'); f.close()
+        scratch_files += [structure_dir]
         notify('({}) Interpolated structure calculated!'.format(model_indices), color = 'g')
 
     # Generate a structure for model meta data
@@ -778,7 +803,7 @@ def extract_results(fit, propagate_gridfit = False, detector_wl = False):
                       is `True`
             cov     : covariance matrix from the Jacobian. Only provided if `propagate_gridfit` is `True`
     """
-    global ATLAS_restarts_header, linelists, xnfpelsyn, spectrv, synthe, loaded_linelist_path
+    global ATLAS_restarts_header, linelists, xnfpelsyn, spectrv, synthe, loaded_linelist_path, scratch_files
 
     # Re-express all abundances with respect to hydrogen
     fit['extra']['abun'] = {'abun': {}, 'errors': {}}
@@ -844,6 +869,7 @@ def extract_results(fit, propagate_gridfit = False, detector_wl = False):
                     f = open('{}/output_summary.out'.format(structure_dir), 'w'); f.write(model); f.close()
                     f = open('{}/output_last_iteration.out'.format(structure_dir), 'w'); f.close()
                     f = open('{}/output_main.out'.format(structure_dir), 'w'); f.close()
+                    scratch_files += [structure_dir]
                 xnfpelsyn.load_structure('{}/output_summary.out'.format(structure_dir))
                 xnfpelsyn.run()
                 synthe.load_linelist(f12, f19, meta, VTURB_LOGG(params['logg']))
@@ -965,6 +991,8 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
         errors, as well as the full covariance matrix estimated with `extract_results(..., propagate_gridfit = False, ...)`.
         The intermediate abundances determined at the end of each iteration are also provided
     """
+    global scratch_files
+
     # Check that all basegrid parameters and all virtual parameters are present in `gridfit`
     basegrid_dof = ['teff', 'logg', 'zscale', 'alpha', 'carbon']
     stellar_parameters = {param: gridfit[param] for param in basegrid_dof + [param for param in settings['virtual_dof'] if param not in settings['elements']]}
@@ -989,14 +1017,11 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
     params = {**stellar_parameters, **settings['initial_abundance_offsets']}
     intermediate = [] # Storage for intermediate abundances at the end of each iteration
 
+    scratch_files = []
     actual_niter = [1, niter][level in [3, 4]]
     for iteration in range(actual_niter):
         notify('*** Starting iteration {} ***'.format(iteration + 1), color = 'm')
         fit = main__chemfit(wl, flux, ivar, initial = params, method = ['gradient_descent', 'gradient_descent+jac'][int(iteration == actual_niter - 1)])
-        if settings['conserve_memory']:
-            to_delete = glob.glob('{}/asynth_*.pkl'.format(settings['scratch']))
-            for filename in to_delete:
-                os.remove(filename)
         if iteration != actual_niter - 1:
             free_memory(False)
             for element in settings['elements']:
@@ -1014,5 +1039,9 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
     fit = extract_results(fit, propagate_gridfit = True, detector_wl = wl)
     free_memory(True)
     fit['extra']['abun']['intermediate'] = intermediate
+
+    if settings['clean_scratch']:
+        for filename in scratch_files:
+            shutil.rmtree(filename)
 
     return fit

@@ -57,86 +57,6 @@ def warn(message):
     if settings['throw_python_warnings']:
         warnings.warn(message)
 
-def read_grid_model(params, grid):
-    """Load a specific model spectrum from the model grid
-
-    All models within the same model grid are expected to have the same wavelength
-    sampling
-    
-    This function definition is a template. The actual implementation is deferred to the
-    settings preset files
-    
-    Parameters
-    ----------
-    params : dict
-        Dictionary of model parameters. A value must be provided for each grid
-        axis, keyed by the axis name
-    grid   : dict
-        Model grid dimensions, previously obtained with `read_grid_dimensions()`
-    
-    Returns
-    -------
-    wl : array_like
-        Grid of model wavelengths in A
-    flux : array_like
-        Corresponding flux densities in wavelength space in arbitrary units
-    meta : dict
-        Dictionary with additional model data that will be made available to the model
-        preprocessor
-    """
-    raise NotImplementedError()
-
-def preprocess_grid_model(wl, flux, params, meta):
-    """Preprocess a model spectrum
-
-    The purpose of the preprocessor is to apply the effect of virtual degrees of freedom
-    to the model spectrum. If additional model data are required to do that, they may be
-    loaded by `read_grid_model()` and returned as the `meta` argument, which is made
-    available to the preprocessor
-    
-    This function definition is a template. The actual implementation is deferred to the
-    settings preset files
-    
-    Parameters
-    ----------
-    wl : array_like
-        Grid of model wavelengths in A, as loaded by `read_grid_model()`
-    flux : array_like
-        Corresponding flux densities in wavelength space in arbitrary units, as loaded by
-        `read_grid_model()`
-    params : dict
-        Parameters of the model, including both real and virtual degrees of freedom
-    meta : dict
-        Dictionary with additional model data, as loaded by `read_grid_model()`
-    
-    Returns
-    -------
-    flux : array_like
-        Processed flux. The flux array must be sampled over the same wavelengths as the
-        original model (i.e. the wavelength array in `wl`)
-    """
-    raise NotImplementedError()
-
-def read_grid_dimensions(flush_cache = False):
-    """Determine the available dimensions in the model grid and the grid points
-    available in those dimensions
-    
-    This function definition is a template. The actual implementation is deferred to the
-    settings preset files
-    
-    Parameters
-    ----------
-    flush_cache : bool, optional
-        If True, discard cache and scan the grid afresh
-    
-    Returns
-    -------
-    dict
-        Dictionary of lists, keyed be grid axis names. The lists contain unique
-        values along the corresponding axis that are available in the grid
-    """
-    raise NotImplementedError()
-
 def apply_standard_mask(exclude, original_mask = False):
     """Helper function to extend standard masks. Primarily intended to be used in settings files
     
@@ -195,9 +115,10 @@ def initialize(*presets):
     Instrument specifications, fitting parameters, model grid handling and other required data and procedures
     are stored in a collection of Python scripts referred to as presets. The scripts may be found in the
     "settings" directory. Each script is expected to define a `settings` dictionary, the entries of which will
-    then be used to update the global `settings` dictionary. Optionally, the scripts may also define the
-    `read_grid_model()` and `read_grid_dimensions()` functions, following the templates in this file. These
-    functions will be used to load model spectra during the fitting process
+    then be used to update the global `settings` dictionary. One of the employed presets must also define the
+    `read_grid_model()`, `read_grid_dimensions()`, `preprocess_grid_model()` and `delete_grid_model()` functions,
+    following the blank templates in the "default" preset. chemfit will use these functions to interact with
+    the model grid
 
     Note that the "default" preset will be loaded automatically
 
@@ -209,7 +130,7 @@ def initialize(*presets):
         recommended to store global parameters in the former file (versioned) and machine-specific parameters in
         the latter file (not versioned, i.e. ignored)
     """
-    global read_grid_model, read_grid_dimensions, preprocess_grid_model, settings
+    global read_grid_model, read_grid_dimensions, preprocess_grid_model, delete_grid_model, settings
 
     # Reset settings
     settings = {}
@@ -248,6 +169,10 @@ def initialize(*presets):
                 pass
             try:
                 preprocess_grid_model = module.preprocess_grid_model
+            except:
+                pass
+            try:
+                delete_grid_model = module.delete_grid_model
             except:
                 pass
 
@@ -360,7 +285,7 @@ def get_bin_edges(bins):
 
     return np.concatenate([[bins[0] - (bins[1] - bins[0]) / 2], (bins[1:] + bins[:-1]) / 2, [bins[-1] + (bins[-1] - bins[-2]) / 2]])
 
-def convolution_weights(bins, x, sigma, clip = 5.0, mode = 'window', max_size = 25e6, flush_cache = False):
+def convolution_weights(bins, x, sigma, clip = 5.0, mode = 'window', max_size = 25e6):
     """Calculate the complete convolution matrix for an arbitrary flux density spectrum
     and an arbitrary set of detector bins
     
@@ -409,8 +334,6 @@ def convolution_weights(bins, x, sigma, clip = 5.0, mode = 'window', max_size = 
         Maximum number of non-zero elements in the convolution matrix. An exception is thrown
         if the predicted number of non-zero elements exceeds this argument. The number of
         non-zero elements directly correlates with memory usage
-    flush_cache : bool, optional
-        If True, discard cache and calculate the convolution matrix afresh
     
     Returns
     -------
@@ -438,10 +361,9 @@ def convolution_weights(bins, x, sigma, clip = 5.0, mode = 'window', max_size = 
         mode = 'window'
 
     # Check for cached output
-    if not flush_cache:
-        hash_string = ''.join(list(map(lambda arg: hashlib.sha256(bytes(arg)).hexdigest(), [bins, x, sigma]))) + str(clip) + mode
-        if hash_string in _convolution_weights_cache:
-            return _convolution_weights_cache[hash_string]
+    hash_string = ''.join(list(map(lambda arg: hashlib.sha256(bytes(arg)).hexdigest(), [bins, x, sigma]))) + str(clip) + mode
+    if hash_string in _convolution_weights_cache:
+        return _convolution_weights_cache[hash_string]
 
     # Check dimensions of `sigma` depending on the mode
     if mode == 'window':
@@ -511,6 +433,17 @@ def convolution_weights(bins, x, sigma, clip = 5.0, mode = 'window', max_size = 
 
     _convolution_weights_cache[hash_string] = C
     return C
+
+def flush_convolution_weights_cache():
+    """Flush the static cache of `convolution_weights()`
+
+    This function only removes the symbols. To free the allocated memory, the user
+    must either wait for automatic garbage collection or force the garbage collector
+    to run manually
+    """
+    global _convolution_weights_cache
+
+    _convolution_weights_cache = {}
 
 def combine_arms(wl = None, flux = None, return_arm_index = False):
     """Combine wavelengths and fluxes recorded by individual spectrograph arms into
@@ -804,6 +737,7 @@ class ModelGridInterpolator:
                 if model in required_models or to_delete == 0:
                     remaining += [model]
                 else:
+                    delete_grid_model(self._loaded[model][1])
                     del self._loaded[model]
                     to_delete -= 1
             self._loaded_ordered = remaining
@@ -845,18 +779,6 @@ class ModelGridInterpolator:
         # The former choice makes sense if no virtual dimensions are being fit. Since virtual parameters can
         # change their values between accesses, we need to run preprocessing / resampling after each access
         resample_after_read = len(list(set(self._dof) & set(settings['virtual_dof']))) == 0
-
-        # Parallelization
-        if ('parallel' in settings) and (settings['parallel'] == True):
-            request = []
-            for model in new_models:
-                params = np.array(model.split('|')).astype(float)
-                keys = sorted(list(real_x.keys()))
-                params = {keys[i]: params[i] for i in range(len(keys))}
-                params_ordered = [params[key] for key in sorted(list(subgrid.keys()))]
-                request += [params]
-            if len(request) > 1:
-                read_grid_model(request, self._grid, batch = True)
 
         # Load the new models
         for model in new_models:
@@ -924,6 +846,10 @@ class ModelGridInterpolator:
 
     def __call__(self, params):
         return self.interpolate(params)
+
+    def __del__(self):
+        for model in self._loaded:
+            delete_grid_model(self._loaded[model][1])
 
 def ranges_to_mask(arr, ranges, in_range_value = True, strict = False):
     """Convert a list of value ranges into a boolean mask, such that all values in `arr` that
