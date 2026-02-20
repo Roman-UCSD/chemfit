@@ -377,6 +377,7 @@ def build_BasicATLAS_linelist(output_dir, wl_start, wl_end, res, C12C13, atoms, 
         raise ValueError('BasicATLAS produced an error when calculating the linelist. The bash script was saved in {}'.format(script_dump))
     if result.stdout != '':
         print(result.stdout, file = sys.stderr)
+public__build_BasicATLAS_linelist = build_BasicATLAS_linelist
 
 def read_grid_dimensions():
     """Normally, this function returns the available dimensions in the model grid and the grid points available in those dimensions;
