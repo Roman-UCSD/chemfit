@@ -3,16 +3,11 @@
 #                         PFS PRESET                       #
 #                                                          #
 #   This preset configures chemfit to analyze PFS spectra. #
-#   It defines a set of fitting masks for the key          #
-#   parameters (the masks are inherited from Evan's        #
-#   original fitter), and defines typical wavelength       #
-#   coverage and resultion of the arms of PFS              #
+#   It defines typical wavelength coverage and resultion   #
+#   of the arms of PFS                                     #
 #                                                          #
 ############################################################
 
-
-# This is the "aggressive" telluric mask that attempts to completely remove all regions affected by telluric absoprption
-telluric_mask = [[6270, 6330], [6860, 6970], [7150, 7400], [7590, 7715], [8100, 8380], [8915, 9910], [10730, 12300], [12450, 12900]]
 
 settings = {
     ### Spectrograph settings ###
@@ -34,7 +29,4 @@ settings = {
             'wl': np.linspace(9400, 12600, 4096),
         }
     },
-
-    ### Fitting masks ###
-    'masks': apply_standard_mask(telluric_mask, original_settings['masks']),
 }

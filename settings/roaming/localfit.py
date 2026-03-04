@@ -42,14 +42,6 @@ import gc, ctypes
 sys.path.append('{}/PyTLAS/'.format(atlas.python_path))
 import PyTLAS
 
-
-# This is the "defective" mask that removes parts of the spectrum where the models do not match the spectra of 
-# Arcturus and the Sun well
-defective_mask = [[3800, 4000], [4006, 4012], [4065, 4075], [4093, 4110], [4140, 4165], [4170, 4180], [4205, 4220],
-                 [4285, 4300], [4335, 4345], [4375, 4387], [4700, 4715], [4775, 4790], [4855, 4865], [5055, 5065],
-                 [5145, 5160], [5203, 5213], [5885, 5900], [6355, 6365], [6555, 6570], [7175, 7195], [7890, 7900],
-                 [8320, 8330], [8490, 8505], [8530, 8555], [8650, 8672]]
-
 settings = {
     # Stellar parameters (teff, logg, zscale, alpha, carbon) of the observed spectrum. A subset of these parameters
     # can be allowed to deviate from the provided values using the 'gridfit_offsets' setting. All 5 parameters must be
@@ -133,9 +125,6 @@ settings = {
 
     # Scratch directory to store atmospheric structures and linelists. Must be specified in the local settings preset
     'scratch': original_settings['scratch'],
-
-    # Apply the defective mask to the fits
-    'masks': apply_standard_mask(defective_mask, original_settings['masks']),
 }
 
 # Define the ranges of "virtual" parameters (i.e. parameters that are not dimensions of the model grid). For this preset, the virtual parameters
@@ -172,7 +161,8 @@ xnfpelsyn = PyTLAS.init_xnfpelsyn()
 synthe = PyTLAS.init_synthe()
 spectrv = PyTLAS.init_spectrv()
 
-# References to chemfit.chemfit(), chemfit.simulate_observation() and chemfit.estimate_continuum() which will be populated when this
+# References to chemfit.chemfit(), chemfit.simulate_observation(), chemfit.estimate_continuum() and chemfit.compute_covariance() which
+# will be populated when this
 # preset is initialized
 def main__chemfit():
     pass
@@ -180,14 +170,16 @@ def main__simulate_observation():
     pass
 def main__estimate_continuum():
     pass
+def main__compute_covariance():
+    pass
 
 def notify(message, color = 'k'):
     """Print a status notification
-    
+
     This is a wrapper around `print()`, which makes it suppressible by `settings['silent']`. We also allow color printing, with the
     default color ('k') meaning "uncolored". Printed messages are flushed immediately to provide real time updates when running
     the fitter on a cluster
-    
+
     Parameters
     ----------
     message : str
@@ -206,12 +198,12 @@ def generate_hash(data):
 
     The function serializes the data structure using the `pickle` module before calculating the MD5 checksum. This function is primarily
     intended to generate unique filenames for model atmospheres, ODFs and linelists based on their parameters
-    
+
     Parameters
     ----------
     data : object
         Any data structure that can be serialized with `pickle`
-    
+
     Returns
     -------
     str
@@ -222,7 +214,7 @@ def generate_hash(data):
 def code_to_nelion(code):
     """Convert a Kurucz species code into the corresponding NELION index, i.e. the index of that species in the XNFPEL and DOPPLE arrays
     defined by XNFPELSYN
-    
+
     Kurucz species codes are used by ATLAS to uniquely identify atomic, ionic, and molecular species:
         - Atomic species are given by their atomic (proton) number. E.g., neutral carbon is 6.00
         - Ionic species encode the ionization state in the hundredths place. E.g., doubly ionized carbon (C III) is 6.02
@@ -243,7 +235,7 @@ def code_to_nelion(code):
     ----------
     code : number
         Input Kurucz code of the atomic, ionic or molecular species
-    
+
     Returns
     -------
     int
@@ -309,7 +301,7 @@ def build_BasicATLAS_linelist(output_dir, wl_start, wl_end, res, C12C13, atoms, 
           linelists are treated identically
         - fort.93 is the meta data, which include the total number of lines, wavelength sampling parameters, air/vacuum setting and the line
           strength cutoff in SYNTHE
-    
+
     Parameters
     ----------
     output_dir : str
@@ -384,12 +376,12 @@ def read_grid_dimensions():
     however, LOCALFIT does not use a grid of pre-computed models. Instead, this function returns a placeholder grid centered on the
     input stellar parameters (`settings['gridfit_params']`) with grid points determined based on parameter offsets in
     `settings['gridfit_offsets']`
-    
+
     This function also pre-computes the linelist for the required combination of `settings['gridfit_params']` and
     `settings['gridfit_offsets']` values and loads it into memory. Since the C12-C13 isotope abundance ratio is "baked in" the linelist,
     we do not account for variations in the isotope ratio with stellar parameters (instead, the C12-C13 ratio corresponding to the
     central stellar parameters in `settings['gridfit_params']` will be used in all spectral synthesis)
-    
+
     Returns
     -------
     dict
@@ -767,165 +759,81 @@ def preprocess_grid_model(wl, flux, params, meta):
 
     return flux
 
-def extract_results(fit, propagate_gridfit = False, detector_wl = False):
-    """Extract best-fit abundances and errors from the `chemfit.chemfit()` output
-    
-    This function re-expresses all abundances with respect to hydrogen ([X/H]), such that we do not need to worry about
-    uncertainties in best-fit metallicity and alpha-enhancement
+def extract_results(fit, gridfit, jacobian):
+    """Convert the abundances inferred with `chemfit()` to the absolute scale ([X/H]), and propagate the errors in
+    the fixed stellar parameters into the abundance errors
 
-    If `propagate_gridfit` is `True`, the function will also update the errors in the best-fit abundances to include
-    the contributions due to uncertainties in other fixed stellar parameters (i.e. teff, logg and carbon if any of
-    those were not allowed to vary in `settings['gridfit_offsets']`)
+    Error propagation is only applied to teff, logg and carbon. The errors in zscale and alpha are not propagated,
+    because all abundances are determined with respect to hydrogen, and it is assumed that the included elements
+    (`settings['elements']`) account for all of the important spectral sensitivity to zscale/alpha
 
-    The error propagation is only approximate. It assumes local linearity of the parameter space, ignores statistical
-    and photometric priors used in GRIDFIT and assumes that the derivatives of the objective function with repsect to
-    stellar parameters do not depend on the abundances of individual elements. It also assumes that the exact same
-    spectrum and masking were used by GRIDFIT to obtain the stellar parameters, as the ones used in LOCALFIT
-    
+    Errors are propagated based on the provided Jacobian using standard error propagation
+
     Parameters
     ----------
     fit : dict
-        Output of `chemfit.chemfit()`
-    propagate_gridfit : bool, optional
-        Set to `True` to propagate the uncertainties in Teff, log(g) and [C/M] (if any of those were fixed during the fit)
-        into the errors in best-fit abundances. Defaults to `False`
-    detector_wl : dict, optional
-        If `propagate_gridfit` is set to `True`, this argument must be set to the observed wavelengths, i.e. the `wl`
-        argument given to `chemfit.chemfit()`
-    
+        Output of `chemfit()`
+    gridfit : dict
+        Stellar parameters of the spectrum inferred with GRIDFIT. See the documentation of `localfit()`
+    jacobian: tuple
+        The Jacobian evaluated for teff, logg and carbon at all wavelength included in the fit. See the
+        documentation of `localfit()`
+
     Returns
     -------
     dict
-        Modified `fit` dictionary with the additional `['abun']` key that stores the following data in
-        its sub-keys:
-            abund   : dictionary of best-fit abundances with respect to hydrogen
-            errors  : dictionary of errors in best-fit abundances
-            dof     : order of parameters in the covariance matrix. Only provided if `propagate_gridfit`
-                      is `True`
-            cov     : covariance matrix from the Jacobian. Only provided if `propagate_gridfit` is `True`
+        Dictionary containing absolute abundances, propagated errors and the covariance matrix
     """
     global ATLAS_restarts_header, linelists, xnfpelsyn, spectrv, synthe, loaded_linelist_path, scratch_files
 
     # Re-express all abundances with respect to hydrogen
-    fit['extra']['abun'] = {'abun': {}, 'errors': {}}
+    output = {'fit': {}, 'errors': {}}
     for element in settings['elements']:
-        ratio = '[{}/H]'.format(element)
-        fit['extra']['abun']['abun'][ratio] = fit['fit'][element]
-        fit['extra']['abun']['errors'][ratio] = fit['errors'][element]
-        fit['extra']['abun']['abun'][ratio] += settings['gridfit_params']['zscale']
+        output['fit'][element] = fit['fit'][element] + settings['gridfit_params']['zscale']
         if element in settings['alpha_elements']:
-            fit['extra']['abun']['abun'][ratio] += settings['gridfit_params']['alpha']
+            output['fit'][element] += settings['gridfit_params']['alpha']
 
-    # Propagate the errors in teff, logg and carbon into the abundances
-    if propagate_gridfit:
-        notify('*** Propagating gridfit uncertainties into best-fit abundances ***', color = 'm')
+    notify('Calculating covariance matrix...')
 
-        # Helper function to adapt model spectra to observations (downsampling, rebinning, masking, continuum-correction)
-        def observe(wl, flux, detector_wl):
-            ds_wl, ds_flux = main__simulate_observation(wl, flux, detector_wl = detector_wl)
-            cont = main__estimate_continuum(ds_wl, fit['extra']['observed']['flux'] / ds_flux, fit['extra']['observed']['ivar'] * ds_flux ** 2, npix = settings['cont_pix'], k = settings['spline_order'], arm_index = fit['extra']['arm_index'])
-            return (cont * ds_flux)[fit['extra']['mask']]
+    # Merge LOCALFIT and GRIDFIT Jacobians
+    assert np.shape(jacobian[1])[0] == np.shape(fit['extra']['jac'])[0]
+    added_dof = [dof for dof in ['teff', 'logg', 'carbon'] if dof not in fit['extra']['fit']['dof']]
+    added_dof_indices = [list(jacobian[0]).index(dof) for dof in added_dof]
+    fit['extra']['jac'] = np.hstack([fit['extra']['jac'], jacobian[1][:,added_dof_indices]])
+    output['dof'] = fit['extra']['fit']['dof'].tolist() + added_dof
 
-        # Which degrees of freedom do we need to add to the Jacobian?
-        added_dof = [dof for dof in ['teff', 'logg', 'carbon'] if dof not in fit['extra']['fit']['dof']]
+    # Compute the covariance matrix
+    best_fit = [fit['fit'][dof] for dof in output['dof']]
+    fixed_param_errors = np.full(len(best_fit), np.nan)
+    for param in gridfit:
+        if len(np.atleast_1d(gridfit[param])) == 2:
+            if fit['fit'][param] != gridfit[param][0]:
+                raise ValueError('The best-fit value of parameter {} has been updated during the fit. The provided uncertainty in this parameter therefore cannot be used'.format(param))
+            fixed_param_errors[output['dof'].index(param)] = gridfit[param][1]
+    output['cov'] = main__compute_covariance(fit['extra']['jac'], fit['extra']['fit']['x'], fit['extra']['fit']['y'], fit['extra']['fit']['sigma'], fit['extra']['fit']['f'], best_fit, fixed_param_errors = fixed_param_errors)
 
-        # Compute derivatives for those degrees of freedom
-        if len(added_dof) != 0:
-            notify('Computing derivative{} in {}'.format(['', 's'][int(len(added_dof) > 1)], ','.join(added_dof)), color = 'y')
+    # Reorganize the output to include the errors in all parameters determined by LOCALFIT in 'errors'
+    # and the best-fit values of all degrees of freedom in 'fit'
+    for dof in output['dof']:
+        if dof in fit['extra']['fit']['dof']:
+            output['errors'][dof] = np.sqrt(np.diag(output['cov'])[output['dof'].index(dof)])
+            if dof not in output['fit']:
+                output['fit'][dof] = fit['fit'][dof]
+        else:
+            output['fit'][dof] = np.atleast_1d(gridfit[dof])[0]
 
-            # Generate the all-inclusive line list
-            if not settings['conserve_memory']:
-                f12 = np.concatenate([linelists[element][0] for element in linelists])
-                f19 = np.concatenate([linelists[element][1] for element in linelists])
-                meta = copy.deepcopy(linelists['null'][2])
-                meta['n_lines'] = len(f12)
-                meta['n_lines_f19'] = len(f19)
-            else:
-                f12, f19, meta = PyTLAS.load_linelist(loaded_linelist_path)
-            free_memory(True, False)
-
-            for dof in ['nominal'] + added_dof:
-                params = {param: fit['fit'][param] for param in settings['gridfit_params']}
-                steps = {'teff': 10, 'logg': 0.1, 'carbon': 0.1}
-                if dof != 'nominal':
-                    if params[dof] + steps[dof] <= np.max(ATLAS_restarts_header[dof]):
-                        step = steps[dof]
-                    else:
-                        step = -steps[dof]
-                    params[dof] += step
-                ATLAS_settings = atlas.Settings()
-                ATLAS_settings.teff = np.round(params['teff'], 0)
-                ATLAS_settings.logg = np.round(params['logg'], 3)
-                ATLAS_settings.zscale = np.round(params['zscale'], 3)
-                ATLAS_settings.Y = 0.245
-                ATLAS_settings.abun = {element: np.round(params['alpha'], 2) for element in settings['alpha_elements']}
-                ATLAS_settings.abun['C'] = np.round(params['carbon'] + ATLAS_restarts_header['carbon_map']([params['zscale'], params['logg']])[0], 2)
-                structure_id = '{}_interpolated'.format(generate_hash([ATLAS_settings.teff, ATLAS_settings.logg, ATLAS_settings.zscale, ATLAS_settings.abun]))
-                structure_dir = '{}/structure_{}'.format(settings['scratch'], structure_id)
-                args = {'teff': ATLAS_settings.teff, 'logg': ATLAS_settings.logg, 'zscale': ATLAS_settings.zscale, 'alpha': ATLAS_settings.abun['Mg'], 'carbon': np.round(params['carbon'], 2)}
-                structure = atlas.restarts.interpolate_structure(args, header = ATLAS_restarts_header)
-                if not os.path.isdir(structure_dir):
-                    model = atlas.restarts.generate_model(*structure)
-                    os.mkdir(structure_dir)
-                    f = open('{}/output_summary.out'.format(structure_dir), 'w'); f.write(model); f.close()
-                    f = open('{}/output_last_iteration.out'.format(structure_dir), 'w'); f.close()
-                    f = open('{}/output_main.out'.format(structure_dir), 'w'); f.close()
-                    scratch_files += [structure_dir]
-                xnfpelsyn.load_structure('{}/output_summary.out'.format(structure_dir))
-                xnfpelsyn.run()
-                synthe.load_linelist(f12, f19, meta, VTURB_LOGG(params['logg']))
-                synthe.load_xnfpelsyn(xnfpelsyn)
-                synthe.run()
-                spectrv.load_xnfpelsyn(xnfpelsyn)
-                spectrv.load_synthe(synthe)
-                spectrv.run()
-                spectrum = observe(*spectrv.get_spectrum()[:2], detector_wl)
-                if dof == 'nominal':
-                    nominal = spectrum
-                else:
-                    fit['extra']['jac'] = np.hstack([fit['extra']['jac'], np.array([(spectrum - nominal) / step]).T])
-
-            notify('Derivatives computed!', color = 'g')
-
-        all_dof = fit['extra']['fit']['dof'].tolist() + added_dof
-
-        # Now that we have the Jacobian matrix fully populated, we can compute the covariance matrix using the standard
-        # error propagation formula:
-        #            COV = (J^T x diag(IVAR) x J)^-1
-        # We also scale the covariance matrix by the reduced chi-squared (SUM((OBSERVED - MODEL)^2 * IVAR) / (N_points - N_params))
-        # to mimick scp.optimize.curve_fit()'s `absolute_sigma = False` setting
-
-        # Compute reduced chi squared for the final fit
-        residuals = (fit['extra']['observed']['flux'] - (fit['extra']['model']['cont'] * fit['extra']['model']['flux']))[fit['extra']['mask']] * fit['extra']['observed']['ivar'][fit['extra']['mask']] ** 0.5
-        chi2_red = np.sum(residuals ** 2) / (np.shape(fit['extra']['jac'])[0] - np.shape(fit['extra']['jac'])[1])
-
-        # Handle degrees of freedom with zero Jacobians
-        singular = np.array([np.all(fit['extra']['jac'][:,i] == 0.0) for i in range(len(all_dof))])
-        if np.any(singular):
-            notify('The spectrum is insensitive to {}'.format(','.join(np.array(all_dof)[singular])), color = 'r')
-
-        # Compute the covariance matrix and update the errors in abundances
-        weighted_jacobian = fit['extra']['jac'][:,~singular] * (fit['extra']['observed']['ivar'] ** 0.5)[fit['extra']['mask']][:, np.newaxis]
-        fit['extra']['abun']['cov'] = np.linalg.pinv(weighted_jacobian.T @ weighted_jacobian) * chi2_red
-        fit['extra']['abun']['dof'] = np.array(all_dof)[~singular].tolist()
-        for element in settings['elements']:
-            if element in fit['extra']['abun']['dof']:
-                fit['extra']['abun']['errors']['[{}/H]'.format(element)] = np.sqrt(fit['extra']['abun']['cov'][tuple([fit['extra']['abun']['dof'].index(element)] * 2)])
-            else:
-                fit['extra']['abun']['errors']['[{}/H]'.format(element)] = np.inf
-
-    return fit
+    return output
 
 def free_memory(clear_linelist, clear_PyTLAS = True):
     """Helper function to de-allocate memory associated with PyTLAS and release it to the operating system once a
     `chemfit.chemfit()` fitting run is done
-    
+
     In this context, "memory associated with PyTLAS" refers to all of the global variables that are used to
     interface with PyTLAS Fortran libraries, including `linelists`, `synthe` and `spectrv`
 
     After deleting the relevant variables, this function both dispatches the Python garbage collector, and also runs
     glibc's `malloc_trim()` routine, as it is sometimes necessary to fully release garbage-collected memory
-    
+
     Parameters
     ----------
     clear_linelist : bool
@@ -952,22 +860,48 @@ def free_memory(clear_linelist, clear_PyTLAS = True):
         linelists = {}
     return
 
-def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, level = 1, niter = 5):
+def public__localfit(wl, flux, ivar, gridfit, mask, jacobian, initial_abundance_offsets = {}, level = 1, niter = 5):
     """Determine the abundances of individual elements using response functions computed at runtime
-    
-    This is a wrapper around `chemfit.chemfit()`, which should be used instead of `chemfit.chemfit()`
-    for the LOCALFIT preset
-    
+
+    It is generally expected that GRIDFIT had been run prior to calling this function. The output dictionary of
+    `gridfit()` contains the 'localfit' key which stores the recommended input values for the `wl`, `flux`,
+    `ivar`, `gridfit`, `mask` and `jacobian` arguments of this function. The aforementioned parameters are
+    rarely set manually, and it would be difficult to do so
+
+    LOCALFIT will keep all stellar parameters fixed except for those listed in `settings['gridfit_offsets']`;
+    however, it will use the GRIDFIT Jacobian (provided in `jacobian`) and, if relevant, GRIDFIT errors
+    (provided in `gridfit`) to propagate the uncertainties in the fixed stellar parameters into abundance
+    errors
+
+    LOCALFIT is not designed to vary zscale/alpha or account for their uncertainties in error propagation, since
+    all abundances are determined with respect to hydrogen, and it is assumed that the included elements
+    (`settings['elements']`) account for all of the important spectral sensitivity to zscale/alpha
+
     Parameters
     ----------
-    wl : dict
-        Spectrum wavelengths keyed by spectrograph arm
-    flux : dict
-        Spectrum flux densities keyed by spectrograph arm
-    ivar : dict
-        Spectrum weights (inverted variances) keyed by spectrograph arm
+    wl : dict of array_like
+        Observed spectrum wavelengths keyed by spectrograph arm. Must be provided in A, air, rest frame
+    flux : dict of array_like
+        Spectrum flux densities per unit wavelength, keyed by spectrograph arm. The continuum level in the
+        spectrum will be ignored by the fitter, so the flux vectors can be provided in any units and with any
+        normalization
+    ivar : dict of array_like
+        Spectrum weights (inverse variances) keyed by spectrograph arm. The fitter will attempt to rescale
+        the weights to match the observed scatter in the data with respect to the best-fit model, so the
+        exact normalization of the inverse variance arrays is less important (see `compute_covariance()`)
     gridfit : dict
-        Stellar parameters of the spectrum (required keys are 'teff', 'logg', 'zscale', 'alpha' and 'carbon')
+        Stellar parameters of the spectrum inferred with GRIDFIT (required keys are 'teff', 'logg', 'zscale',
+        'alpha' and 'carbon'). If the values of any of these parameters were determined not from the spectrum
+        given in `wl`/`flux`/`ivar`, the corresponding dictionary element must be set to a two-element tuple
+        with the zeroth element storing the parameter value, and the first element storing the one-sigma error.
+        This is typically only applicable to teff, which is estimated by GRIDFIT from photometry
+    mask : list
+        List of wavelength intervals to exclude from the fit. The wavelengths must be given in rest frame
+    jacobian: tuple
+        The Jacobian evaluated for teff, logg and carbon at all wavelength pixels listed in `wl` that are not
+        excluded by `mask`. The zeroth element of the tuple is a list of degrees of freedom in the Jacobian,
+        and the first element is an NxM Jacobian matrix where N is number of degrees of freedom from the zeroth
+        element, and M is the number of unmasked spectral pixels
     initial_abundance_offsets : dict, optional
         Dictionary of initial abundance offsets from the zscale+alpha+carbon nominal chemistry to be used in the
         fitter. The keys must only include elements from `settings['elements']`. Defaults to no offsets
@@ -984,23 +918,47 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
                 iteration with the determined abundances
     niter : number, optional
         Number of iterations to carry out. Only relevant if the analysis level is 3 or 4
+
     Returns
     -------
     dict
-        Fitting results. The structure of the dictionary is the same as in the output of `chemfit.chemfit()` with
-        one additional key: ['extra']['abun']. This key contains the best-fit element abundances ([X/H]) and their
-        errors, as well as the full covariance matrix estimated with `extract_results(..., propagate_gridfit = False, ...)`.
-        The intermediate abundances determined at the end of each iteration are also provided
+        Fitting results. This is a multi-level dictionary with the following keys:
+
+        - [fit]: Inferred values of best-fit abundances and stellar parameters. The stellar parameters listed
+                 include both those that were determined by LOCALFIT (`settings['gridfit_offsets']`), as well
+                 as those, whose values were inherited from GRIDFIT. However, zscale and alpha are excluded
+                 since element abundances are inferred with respect to hydrogen
+        - [errors]: Errors in the best-fit abundances and stellar parameters. Unlike [fit], this key only lists
+                    those stellar parameters that were determined by LOCALFIT
+        - [extra][observed][wl]: Observed spectrum wavelengths in A, in air, transformed to rest frame
+        - [extra][observed][flux]: Observed flux densities, as provided in `flux`
+        - [extra][observed][ivar]: Inverse variances of the pixels of the observed spectrum, as in `ivar`
+        - [extra][model][wl]: Best-fit model wavelengths, identical to [extra][observed][wl]
+        - [extra][model][flux]: Best-fit model flux in erg / s / cm^2 / A / sr
+        - [extra][model][cont]: Continuum correction between the observed flux vector and the model
+        - [extra][mask]: Fitting mask, which evaluates to `True` for all spectral pixels that were used in the fit
+        - [extra][dof]: List of degrees of freedom included in the covariance matrix and the Jacobian
+        - [extra][cov]: Covariance matrix, which is an array of shape NxN where N is the number of degrees of freedom
+                        listed in [extra][dof]
+        - [extra][jac]: Jacobian matrix, which is an array of shape MxN where N is the number of degrees of freedom
+                        listed in [extra][dof], and M is the number of unmasked spectral pixels
+        - [extra][arm_index]: The arm index of each pixel in [extra][observed] and [extra][model]. The arm index is an
+                              integer that corresponds to the serial number of the arm that the pixel belongs to. The
+                              arms are indexed in the alphabetical order starting with 0
+        - [extra][intermediate]: Intermediate best-fit element abundances after every iteration carried out by LOCALFIT
+        - [extra][raw_params]: Unprocessed best-fit parameters, i.e. best-fit parameters in the format expected by
+                               ModelGridInterpolator
     """
     global scratch_files
 
     # Check that all basegrid parameters and all virtual parameters are present in `gridfit`
     basegrid_dof = ['teff', 'logg', 'zscale', 'alpha', 'carbon']
-    stellar_parameters = {param: gridfit[param] for param in basegrid_dof + [param for param in settings['virtual_dof'] if param not in settings['elements']]}
+    stellar_parameters = {param: np.atleast_1d(gridfit[param])[0] for param in basegrid_dof + [param for param in settings['virtual_dof'] if param not in settings['elements']]}
 
     if level not in [1, 2, 3, 4]:
         raise ValueError('Unknown analysis level {}'.format(level))
 
+    settings['mask'] = mask
     settings['gridfit_params'] = {param: stellar_parameters[param] for param in basegrid_dof}
     settings['compute_new_structure'] = level in [2, 4]
     settings['initial_abundance_offsets'] = {}
@@ -1022,7 +980,7 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
     actual_niter = [1, niter][level in [3, 4]]
     for iteration in range(actual_niter):
         notify('*** Starting iteration {} ***'.format(iteration + 1), color = 'm')
-        fit = main__chemfit(wl, flux, ivar, initial = params, method = ['gradient_descent', 'gradient_descent+jac'][int(iteration == actual_niter - 1)])
+        fit = main__chemfit(wl, flux, ivar, initial = params, method = 'gradient_descent+jac')
         if iteration != actual_niter - 1:
             free_memory(False)
             for element in settings['elements']:
@@ -1032,14 +990,33 @@ def public__localfit(wl, flux, ivar, gridfit, initial_abundance_offsets = {}, le
             settings['use_initial_abundance_offsets_in_structure'] = level == 4
         else:
             free_memory(False)
-        fit = extract_results(fit, propagate_gridfit = False)
-        intermediate += [copy.deepcopy(fit['extra']['abun'])]
-        notify('Completed iteration {}: {}\n'.format(iteration + 1, {param: '{:.2f}±{:.2f}'.format(fit['extra']['abun']['abun'][param], fit['extra']['abun']['errors'][param]) for param in fit['extra']['abun']['errors']}), color = 'm')
+        results = extract_results(fit, gridfit, jacobian)
+        intermediate += [{'[{}/H]'.format(element): results['fit'][element] for element in settings['elements']}]
+        notify('Completed iteration {}: {}\n'.format(iteration + 1, {element: '{:.2f}±{:.2f}'.format(results['fit'][element], results['errors'][element]) for element in settings['elements']}), color = 'm')
     notify('*** Completed all iterations ***\n')
 
-    fit = extract_results(fit, propagate_gridfit = True, detector_wl = wl)
-    free_memory(True)
-    fit['extra']['abun']['intermediate'] = intermediate
+    # Construct the final fit object
+    results = extract_results(fit, gridfit, jacobian)
+    fit['extra']['intermediate'] = intermediate
+    fit['extra']['cov'] = results['cov']
+    fit['extra']['dof'] = results['dof']
+    fit['extra']['raw_params'] = fit['fit']
+    fit['fit'] = results['fit']
+    fit['errors'] = results['errors']
+    del fit['extra']['fit']
+    del fit['extra']['cost']
+    del fit['interpolator_statistics']
+
+    # Convert element symbols into proper abundance ratios
+    for element in settings['elements']:
+        ratio = '[{}/H]'.format(element)
+        fit['fit'][ratio] = fit['fit'][element]
+        del fit['fit'][element]
+        fit['errors'][ratio] = fit['errors'][element]
+        del fit['errors'][element]
+        fit['extra']['dof'][fit['extra']['dof'].index(element)] = ratio
+
+    free_memory(True, False)
 
     if settings['clean_scratch']:
         for filename in scratch_files:
