@@ -673,7 +673,7 @@ class ModelGridInterpolator:
                 subgrid[key] = np.array([real_x[key]])
             else:
                 subgrid[key] = np.array([np.max(self._grid[key][self._grid[key] < real_x[key]]), np.min(self._grid[key][self._grid[key] > real_x[key]])])
-        required_models = set(['|'.join((np.array(model) + 0.0).astype(str)) for model in itertools.product(*[subgrid[key] for key in sorted(list(subgrid.keys()))])])
+        required_models = set([tuple(np.array(model) + 0.0) for model in itertools.product(*[subgrid[key] for key in sorted(list(subgrid.keys()))])])
         self.statistics['num_models_used'] += len(required_models)
 
         # Determine which of the required models have not been loaded yet
@@ -732,7 +732,7 @@ class ModelGridInterpolator:
 
         # Load the new models
         for model in new_models:
-            params = np.array(model.split('|')).astype(float)
+            params = np.array(model)
             keys = sorted(list(real_x.keys()))
             params = {keys[i]: params[i] for i in range(len(keys))}
             params_ordered = [params[key] for key in sorted(list(subgrid.keys()))]
@@ -752,7 +752,7 @@ class ModelGridInterpolator:
         # Build the interpolator
         subgrid_ordered = [subgrid[key] for key in sorted(list(subgrid.keys()))]
         meshgrid = np.meshgrid(*subgrid_ordered, indexing = 'ij')
-        spectra = np.vectorize(lambda *x: preprocess(self._loaded['|'.join((np.array(x) + 0.0).astype(str))], x, virtual_x, not resample_after_read), signature = ','.join(['()'] * len(self._grid)) + '->(n)')(*meshgrid)
+        spectra = np.vectorize(lambda *x: preprocess(self._loaded[tuple(np.array(x) + 0.0)], x, virtual_x, not resample_after_read), signature = ','.join(['()'] * len(self._grid)) + '->(n)')(*meshgrid)
         setattr(self, '_interpolator', scp.interpolate.RegularGridInterpolator(subgrid_ordered, spectra))
         self._interpolator_models = required_models
         self.statistics['num_interpolators_built'] += 1
