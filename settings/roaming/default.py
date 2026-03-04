@@ -3,9 +3,8 @@
 #             DEFAULT CHEMFIT SETTINGS PRESET              #
 #                                                          #
 #   This preset sets the default synthetic photometry      #
-#   parameters, creates a test spectrograph arm, provides  #
-#   basic fitting masks and defines standard convergence   #
-#   and output parameters                                  #
+#   parameters, creates a test spectrograph arm, defines   #
+#   standard convergence and output parameters             #
 #                                                          #
 ############################################################
 
@@ -26,21 +25,14 @@ settings = {
         },
     },
 
-    ### Fitting masks ###
-    'masks': {
-        'all': {
-            'all': [[100, 100000]],
-        },
-        'continuum': [],
-    },
+    ### Blank fitting mask ###
+    'mask': [],
 
     'max_model_cache': 1000, # Maximum number of models allowed in memory
 
     ### Optimization parameters ###
-    'return_diagnostics': True, # Return best-fit model, continuum correction and fitting masks in the chemfit.chemfit() output
     'gradient_descent': {
         'curve_fit': {
-            'absolute_sigma': False,
             'ftol': 1e-10,
             'gtol': 1e-10,
             'xtol': 1e-10,
@@ -55,9 +47,6 @@ settings = {
     'cont_pix': 165,
     'spline_order': 3,
     'uninterrupted_cont': False,
-
-    ### Warnings ###
-    'throw_python_warnings': True,
 }
 
 def read_grid_model(params, grid):

@@ -1,9 +1,20 @@
+############################################################
+#                         CHEMFIT                          #
+#                                                          #
+# chemfit is a software package for chemical abundance     #
+# inference from low- and medium-resolution stellar        #
+# spectra based on physical forward modeling. chemfit was  #
+# developed for the Subaru PFS Galactic Archaeology        #
+# survey, but can be readily adapted to other instruments  #
+#                                                          #
+# To get started with chemfit, please refer to the         #
+# tutorials/quick_start.ipynb tutorial notebook            #
+#                                                          #
+############################################################
+
 import numpy as np
 import scipy as scp
-import pickle
-import gzip
 import os
-import re
 import hashlib
 import itertools
 import warnings
@@ -15,12 +26,12 @@ import importlib.util
 # evaluations. Since we are demanding fairly narrow tolerance, reaching the maximum number of evaluations is not
 # necessarily fatal (it merely means that the actual tolerance is somewhat less than our default standard). So we would
 # like to deescalate the error to a warning and proceed. Unfortunately, I am unable to find a more elegant way of doing
-# it except by overriding the optimizer function that curve_fit() calls
+# it except by overriding the optimizer function that scp.optimize.curve_fit() calls
 original_least_squares = scp.optimize._minpack_py.least_squares
 def least_squares_wrapper(*args, **kwargs):
     res = original_least_squares(*args, **kwargs)
     if (not res.success) and (res.status == 0):
-        warn('Optimizer failed to reach desired convergence after the maximum number ({}) of function evaluations'.format(res.nfev))
+        warnings.warn('Optimizer failed to reach desired convergence after the maximum number ({}) of function evaluations'.format(res.nfev))
         res.success = True
     return res
 scp.optimize._minpack_py.least_squares = least_squares_wrapper
@@ -28,105 +39,35 @@ scp.optimize._minpack_py.least_squares = least_squares_wrapper
 script_dir = os.path.dirname(os.path.realpath(__file__))
 settings = {}
 
-warnings_stack = []
-warnings_messages = {}
-
-def warn(message):
-    """Issue a warning. Wrapper for `warnings.warn()`
-    
-    Add the warning message to the stack. If required, also throw the normal Python warning
-
-    Instead of storing warning messages in the stack in full, we associate unique numerical
-    identifiers with each distinct message and store them in a dictionary. The stack then
-    only contains the identifiers to save memory
-    
-    Parameters
-    ----------
-    message : str
-        Warning message
-    """
-    global warnings_stack, warnings_messages
-
-    if message not in warnings_messages:
-        warning_id = len(warnings_messages)
-        warnings_messages[message] = warning_id
-    else:
-        warning_id = warnings_messages[message]
-
-    warnings_stack += [warning_id]
-    if settings['throw_python_warnings']:
-        warnings.warn(message)
-
-def apply_standard_mask(exclude, original_mask = False):
-    """Helper function to extend standard masks. Primarily intended to be used in settings files
-    
-    A "standard" fitting mask does not have any arm or parameter-specific components (i.e. only
-    `settings['masks']['all']['all']` and `settings['masks']['continuum']` are populated, and the
-    continuum mask is the inverse of the `['all']['all']` mask. We also require the first included
-    interval to start at 100 A and the last included interval to end at 100000 A
-
-    This function adds additional excluded regions to an existing standard mask, or creates a new
-    standard mask from scratch if the existing (i.e. original) standard mask is not provided
-    
-    Parameters
-    ----------
-    exclude : list
-        List of intervals to exclude from the mask
-    original_mask : dict, optional
-        Original fitting mask (`settings['masks']`) or `False` to create a new mask
-    
-    Returns
-    -------
-    dict
-        Updated (or newly created) fitting mask that can be placed directly into `settings['masks']`
-    """
-    if np.min(exclude) <= 100 or np.max(exclude) >= 100000:
-        raise ValueError('Mask wavelengths must be 100 < wl < 100000')
-
-    # If an original mask is provided, check that it is standard
-    if (type(original_mask) is not bool) and ((len(original_mask['all']['all']) > 0) or (len(original_mask['continuum']) > 0)):
-        if len(original_mask['all']['all']) < 1 or original_mask['all']['all'][0][0] != 100 or original_mask['all']['all'][-1][-1] != 100000:
-            raise ValueError('Cannot extend non-standard mask')
-        original_exclude = np.array(original_mask['all']['all']).flatten()[1:-1]
-        original_exclude = np.reshape(original_exclude, [len(original_exclude) // 2, 2]).tolist()
-        if len(original_exclude) != len(original_mask['continuum']) or (not np.all(original_exclude == original_mask['continuum'])):
-            raise ValueError('Cannot extend non-standard mask')
-
-    masks = {'all': {'all': []}, 'continuum': []}
-    if type(original_mask) is not bool:
-        masks['continuum'] += original_mask['continuum']
-    masks['continuum'] += list(copy.deepcopy(exclude))
-    masks['continuum'].sort(key = lambda x: x[0])
-    merged = []
-    for interval in masks['continuum']:
-        if not merged or merged[-1][1] < interval[0]:
-            merged.append(interval)
-        else:
-            merged[-1][1] = max(merged[-1][1], interval[1])
-    masks['continuum'] = merged
-    masks['all']['all'] = np.concatenate([[100], np.array(masks['continuum']).flatten(), [100000]])
-    assert np.all(np.diff(masks['all']['all']) > 0)
-    masks['all']['all'] = np.reshape(masks['all']['all'], [len(masks['continuum']) + 1, 2]).tolist()
-    return masks
-
 def initialize(*presets):
     """Load the settings presets
 
     Instrument specifications, fitting parameters, model grid handling and other required data and procedures
-    are stored in a collection of Python scripts referred to as presets. The scripts may be found in the
+    are stored in a collection of Python scripts referred to as "presets". The scripts may be found in the
     "settings" directory. Each script is expected to define a `settings` dictionary, the entries of which will
     then be used to update the global `settings` dictionary. One of the employed presets must also define the
     `read_grid_model()`, `read_grid_dimensions()`, `preprocess_grid_model()` and `delete_grid_model()` functions,
     following the blank templates in the "default" preset. chemfit will use these functions to interact with
     the model grid
 
-    Note that the "default" preset will be loaded automatically
+    Note that the "default" preset will be loaded automatically, before any other preset
+
+    All preset scripts will be provided with a copy of the global `settings` dictionary at the time when the
+    preset is loaded. This copy can be accessed from the preset script through the `original_settings` variable.
+    See the definition of `env` in the code below for other environment variables made available to the presets
+
+    Presets may define public functions by prefixing their names with "public__". E.g. if a preset script defines
+    `def public__myfunc():`, the user will be able to call that function as `chemfit.myfunc()`
+
+    Presets may access functions and variables from the main codebase (this file) by defining blank references to
+    them prefixed with "main__". E.g., if a preset script defines `def main__chemfit():`, that reference will be
+    pointed to `chemfit.chemfit()` once the preset is loaded
 
     Parameters
     ----------
     presets : tuple
         Settings presets to load. For each preset, the function will attempt to load both
-        "settings/local/<preset>.py" and "settings/roaming/<preset>.py" in that order, if available. It is
+        "settings/local/<preset>.py" and "settings/roaming/<preset>.py", in that order, if available. It is
         recommended to store global parameters in the former file (versioned) and machine-specific parameters in
         the latter file (not versioned, i.e. ignored)
     """
@@ -136,7 +77,7 @@ def initialize(*presets):
     settings = {}
 
     # Environment variables provided to the preset scripts
-    env = {'script_dir': script_dir, 'np': np, 'original_settings': copy.deepcopy(settings), 'copy': copy, 'warn': warn, 'apply_standard_mask': apply_standard_mask}
+    env = {'script_dir': script_dir, 'np': np, 'original_settings': copy.deepcopy(settings), 'copy': copy}
 
     index = 0 # Load counter to ensure unique module names for all loaded files
     for preset in ['default'] + list(presets):
@@ -192,14 +133,19 @@ initialize()
 def convolution_integral(sigma, segment_left, segment_right, bin_left, bin_right):
     """Calculate weights of the convolution for an arbitrary flux density spectrum
     and a Gaussian kernel with fixed or slowly-varying standard deviation
-    
-    A source with a given (true) flux density spectrum is observed with a detector
-    of given resolution that records the average flux density in a set of wavelength
-    bins. This function estimates the linear coefficients `C1` and `C2` such that
+
+    The problem this function addresses may be described as follows. Consider an
+    astronomical source with a given (true) flux density spectrum, which is observed
+    with a photon-counting detector that consists of bins (pixels), each of which
+    measures the average flux density per unit wavelength in a given wavelength
+    interval. We will further assume that there are no gaps between bins, i.e. the
+    wavelength intervals are contiguous. The line spread function of the detector is
+    assumed to be a Gaussian with the standard deviation (i.e. resolution) given by
+    `sigma`. This function estimates the linear coefficients `C1` and `C2` such that
 
     ``C1 * A + C2 * B``
 
-    gives the contribution of the spectrum segment between the wavelengths
+    yields the contribution of the spectrum segment between the wavelengths
     `segment_left` and `segment_right`, to the detector bin with edge wavelengths
     `bin_left` and `bin_right`. It is assumed that the resolution of the detector
     is constant for each detector bin / spectrum segment pair, and that the flux
@@ -207,13 +153,15 @@ def convolution_integral(sigma, segment_left, segment_right, bin_left, bin_right
 
     ``flux density = A + B * wavelength``
 
+    where "A" and "B" are chosen to approximate the source spectrum
+
     This function is primarily designed to handle model spectra, for which the flux
     density has been calculated at given wavelength points, and can be linearly
     interpolated between those points. The weight coefficients may then be evaluated
     for each segment between adjacent wavelength points, and the contributions
     of each segment can be added together to obtain the total flux density in the
     detector bin
-    
+
     Parameters
     ----------
     sigma : array_like
@@ -228,7 +176,7 @@ def convolution_integral(sigma, segment_left, segment_right, bin_left, bin_right
         Lower wavelength bound of the detector bin of interest
     bin_right : array_like
         Upper wavelength bound of the detector bin of interest
-    
+
     Returns
     -------
     C1 : array_like
@@ -264,21 +212,21 @@ def convolution_integral(sigma, segment_left, segment_right, bin_left, bin_right
 
 def get_bin_edges(bins):
     """Convert reference wavelengths of detector bins to edge wavelengths
-    
+
     `bins` is the array of reference wavelengths of length M. The M-1 inner bin edges are
     taken as midpoints between adjacent values of this array. The 2 outer bin edges are
     estimated by assuming that the first and the last bins are symmetric with respect to
     their reference wavelengths. The input must be strictly ascending
-    
+
     Parameters
     ----------
-    bins : array of length M
-        Reference wavelengths of all detector bins
-    
+    bins : array_like
+        Reference wavelengths of all detector bins, array of length M
+
     Returns
     -------
-    array of length M+1
-        Bin edge wavelengths
+    array_like
+        Bin edge wavelengths, array of length M+1
     """
     if not np.all(bins[1:] > bins[:-1]):
         raise ValueError('Bin wavelengths must be strictly ascending')
@@ -288,11 +236,11 @@ def get_bin_edges(bins):
 def convolution_weights(bins, x, sigma, clip = 5.0, mode = 'window', max_size = 25e6):
     """Calculate the complete convolution matrix for an arbitrary flux density spectrum
     and an arbitrary set of detector bins
-    
+
     The final observed spectrum is then given by `C * flux`, where `flux` is the (true) flux
     density spectrum sampled at wavelengths `x`, and `C` is the convolution matrix calculated
     by this function. Here `*` represents matrix multiplication (dot product)
-    
+
     It is assumed that the flux density between the sampling wavelengths is given by
     linear interpolation, while beyond the range of `x` it is zero
 
@@ -302,23 +250,25 @@ def convolution_weights(bins, x, sigma, clip = 5.0, mode = 'window', max_size = 
     returned as a sparse matrix in the COOrdinate format. The function also checks that the
     memory usage does not exceed the limit provided in the optional argument `max_size`
 
-    The function implements memory caching
-    
+    The function implements memory caching. You may use `flush_convolution_weights_cache()`
+    to flush the cache
+
     Parameters
     ----------
-    bins : array of length M
-        Reference wavelengths of all detector bins. See `get_bin_edges()`
-    x : array of length N
+    bins : array_like
+        Reference wavelengths of all detector bins. See `get_bin_edges()`. Must be strictly
+        ascending
+    x : array_like
         Array of wavelengths where the flux density spectrum is sampled. The segments are
-        defined as the N-1 intervals between adjacent values of this array. Must be
-        strictly ascending
-    sigma : float or array of length M or array of length N
+        defined as the intervals between adjacent values of this array. Must be strictly
+        ascending
+    sigma : number or array_like
         Resolution of the detector, defined as the standard deviation of the Gaussian
         convolution kernel. If scalar, constant resolution is adopted for all bins and all
         segments. If `mode` is 'window', the resolution is defined at each detector bin, and
-        the length of this array must be M. If `mode` is 'dispersion', the resolution is
-        defined at each wavelength in the spectrum and the length of this array must be N
-    clip : float, optional
+        the length of this array must match `bins`. If `mode` is 'dispersion', the resolution
+        is defined at each wavelength in the spectrum and the length of this array must match `x`
+    clip : number, optional
         Assume that the weights for the detector bin / spectrum segment pair are zero if
         the wavelength ranges of the bin and the segment are separated by this many values of
         `sigma` for this pair. The argument removes negligibly small weights from the result,
@@ -334,7 +284,7 @@ def convolution_weights(bins, x, sigma, clip = 5.0, mode = 'window', max_size = 
         Maximum number of non-zero elements in the convolution matrix. An exception is thrown
         if the predicted number of non-zero elements exceeds this argument. The number of
         non-zero elements directly correlates with memory usage
-    
+
     Returns
     -------
     C : scipy.sparse._coo.coo_matrix
@@ -451,7 +401,7 @@ def combine_arms(wl = None, flux = None, return_arm_index = False):
 
     The function returns the combined spectrum with wavelengths sorted in ascending
     order
-    
+
     Parameters
     ----------
     wl : None or list or dict, optional
@@ -468,7 +418,7 @@ def combine_arms(wl = None, flux = None, return_arm_index = False):
     return_arm_index : bool, optional
         If `True`, return the `arm_index` array that allows each value in the output to
         be traced to its arm of origin
-    
+
     Returns
     -------
     wl : array_like
@@ -523,12 +473,12 @@ def combine_arms(wl = None, flux = None, return_arm_index = False):
 
 def simulate_observation(wl, flux, detector_wl = None, mask_unmodelled = True, clip = 5, combine = True):
     """Simulate observation of the model spectrum by a spectrograph
-    
+
     If the model does not fully cover the range of a spectrograph arm, the output flux density
     in the affected detector wavelength bins will be set to `np.nan`. This behavior can be
     disabled by setting `mask_unmodelled` to False, in which case the edge effects of the
     convolution will be left in the output spectrum
-    
+
     Parameters
     ----------
     wl : array_like
@@ -558,7 +508,7 @@ def simulate_observation(wl, flux, detector_wl = None, mask_unmodelled = True, c
         If True, return a single wavelength and a single flux array that represents the combined
         spectrum across all arms of the spectrograph (see `combine_arms()`). Otherwise, return
         the spectra in individual arms
-    
+
     Returns
     -------
     wl : dict or array_like
@@ -595,9 +545,9 @@ def simulate_observation(wl, flux, detector_wl = None, mask_unmodelled = True, c
                     continue
                 else:
                     detector_flux[arm] = np.full(len(detector_flux[arm]), np.nan)
-                    warn(message)
+                    warnings.warn(message)
                     continue
-            warn(message)
+            warnings.warn(message)
             mask = np.full(len(detector_flux[arm]), True)
             if len(first) != 0:
                 mask[detector_wl[arm] <= detector_wl[arm][np.max(first)]] = False
@@ -614,11 +564,11 @@ def simulate_observation(wl, flux, detector_wl = None, mask_unmodelled = True, c
 
 class ModelGridInterpolator:
     """Handler class for interpolating the model grid to arbitrary stellar parameters
-    
+
     The class provides the `interpolate()` method to carry out the interpolation. The
     interpolation is linear with dynamic fetching of models from disk and caching for
     loaded models
-    
+
     Attributes
     ----------
     statistics : dict
@@ -855,7 +805,7 @@ def ranges_to_mask(arr, ranges, in_range_value = True, strict = False):
     """Convert a list of value ranges into a boolean mask, such that all values in `arr` that
     fall in any of the ranges correspond to `in_range_value`, and the rest correspond to
     `not in_range_value`
-    
+
     Parameters
     ----------
     arr : array_like
@@ -868,7 +818,7 @@ def ranges_to_mask(arr, ranges, in_range_value = True, strict = False):
     strict : bool, optional
         If True, use strict comparison (`lower_bound < value < upper_bound`). Otherwise, use
         non-strict comparison (`lower_bound <= value <= upper_bound`)
-    
+
     Returns
     -------
     array_like
@@ -882,20 +832,16 @@ def ranges_to_mask(arr, ranges, in_range_value = True, strict = False):
             mask[(arr >= window[0]) & (arr <= window[1])] = in_range_value
     return mask
 
-def estimate_continuum(wl, flux, ivar, npix = 100, k = 3, masks = None, arm_index = None):
+def estimate_continuum(wl, flux, ivar, npix = 100, k = 3, arm_index = None):
     """Estimate continuum correction in the spectrum using a spline fit
-    
+
     The function carries out a weighted spline fit to a spectrum given by wavelengths in `wl`,
     flux densities in `flux` and using the weights in `ivar` (usually inverted variances)
 
-    The wavelength regions given in `settings['masks']['continuum']` are excluded from the fit.
-    If one of the excluded regions overlaps with the edge of the spectrum, the spline fit near
-    the edge may be poorly conditioned (the spline will be extrapolated in that region, leading
-    to potentially very large edge effects). If that part of the continuum is then used in
-    stellar parameter determination, extremely poor convergence is likely. As such, when the
-    spectral masks used by the fitter are passed in the optional `masks` parameter, it will be
-    updated to mask out the affected region of the spectrum
-    
+    If `settings['uninterrupted_cont']` is `True`, the same spline fit will be used across all
+    arms of the spectrograph. Otherwise, a separate spline will be fit to each arm, thereby
+    allowing for discontinuities in continuum level between arms
+
     Parameters
     ----------
     wl : array_like
@@ -905,18 +851,13 @@ def estimate_continuum(wl, flux, ivar, npix = 100, k = 3, masks = None, arm_inde
     ivar : array_like
         Spectrum weights (inverted variances)
     npix : int, optional
-        Desired interval between spline knots in pixels. The actual interval will be adjusted
-        to keep the number of pixels in each spline segment identical
+        Desired interval between spline knots in pixels
     k : int, optional
         Spline degree. Defaults to cubic
-    masks : dict, optional
-        Dictionary of boolean masks, keyed by stellar parameters. If given, this argument will be
-        modified to exclude the regions of the spectrum potentially affected by spline extrapolation
-        from the main fitter
     arm_index : array_like
         Indices of spectrograph arms corresponding to the provided wavelengths and fluxes. See
         `combine_arms()`
-    
+
     Returns
     -------
     array_like
@@ -929,19 +870,8 @@ def estimate_continuum(wl, flux, ivar, npix = 100, k = 3, masks = None, arm_inde
     else:
         spline_index = arm_index
 
-    # Build a mask of values to be included in the continuum estimation. If parameter masks are provided,
-    # update them to avoid edge effects when necessary
-    mask = (ivar > 0) & (~np.isnan(ivar)) & (~np.isnan(flux))
-    for bad_continuum_range in settings['masks']['continuum']:
-        for index in np.unique(spline_index):
-            include = spline_index == index
-            bad_continuum_range_mask = ranges_to_mask(wl[include], [bad_continuum_range], False)
-            # Check for potential edge effects and remove the affected region from the fit
-            if masks is not None:
-                if (len(bad_continuum_range_mask[mask[include]]) > 0) and ((not bad_continuum_range_mask[mask[include]][-1]) or (not bad_continuum_range_mask[mask[include]][0])):
-                    for param in masks:
-                        masks[param][include] &= ranges_to_mask(wl[include], [bad_continuum_range], False)
-            mask[include] &= bad_continuum_range_mask
+    # Build a mask of values to be included in the continuum estimation
+    mask = (ivar > 0) & (~np.isnan(ivar)) & (~np.isnan(flux)) & ranges_to_mask(wl, settings['mask'], False)
 
     # Fit the spline
     result = np.full(len(wl), np.nan)
@@ -957,15 +887,126 @@ def estimate_continuum(wl, flux, ivar, npix = 100, k = 3, masks = None, arm_inde
             result[spline_index == index] = 1.0
     return result
 
-def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator, arm_index, phot, method):
+def compute_jacobian(func, x, best_fit, bounds):
+    """Compute the Jacobian matrix of the function `func` evaluated at input values `x` and parameter vector
+    `best_fit`, using finite differences with prescribed parameter bounds
+
+    Parameters
+    ----------
+    func : callable
+        The function of interest. The function must take `x` (input values) as its first argument, followed by
+        arguments for each parameter whose value is listed in `best_fit`
+    x : array_like
+        Input values
+    best_fit : list
+        Values of the function arguments that define the point in parameter space at which the Jacobian is computed
+    bounds : list
+        Parameter bounds, equivalent to the `bounds` parameter of `scipy.optimize.curve_fit()`
+
+    Returns
+    -------
+    array_like
+        The Jacobian matrix of shape (len(x), len(best_fit))
+    """
+    jac = scp.optimize._numdiff.approx_derivative(lambda args: func(x, *args), best_fit, bounds = bounds)
+    jac = np.atleast_2d(jac)
+    return jac
+
+def compute_covariance(jacobian, x, y, sigma, y_model, best_fit, fixed_param_errors = False, absolute_sigma = False):
+    """Use the uncertainty propagation principles to estimate the covariance matrix of best-fit model parameters
+
+    The model is of the form `y_model == func(x, *parameters)` and it has been fit to the data (`x`, `y`, `sigma`). The
+    model parameters are divided into "fitted" and "fixed". The values of the fitted parameters have been determined
+    from the model fit. The values of fixed parameters and the corresponding uncertainties have been determined independently
+    of the data (e.g. in stellar physics context, some parameters may have been estimated from isochrones without spectral
+    fitting)
+
+    This function requires a pre-computed Jacobian matrix, e.g. using `compute_jacobian()`. The function will assume that
+    the fixed parameters are independent of one another
+
+    Parameters
+    ----------
+    jacobian : array_like
+        The Jacobian matrix of the function with shape (len(x), len(best_fit)) at the parameter vector `best_fit`
+    x : array_like
+        Data x-values (independent variable)
+    y : array_like
+        Data y-values (dependent variable)
+    sigma : array_like
+        Uncertainties in the data y-values
+    y_model : array_like
+        Modeled y-values evaluated at `x` for model parameters in `best_fit`
+    best_fit : list
+        Model parameters (including both fitted and fixed)
+    fixed_param_errors : list, optional
+        Uncertainties (one-sigma) in the values of fixed model parameters listed in `best_fit`. The list elements corresponding
+        to fitted parameters must be set to `np.nan`. Defaults to `False`, which resets this argument to a list full of `np.nan`
+        (i.e. all parameters are fitted)
+    absolute_sigma : bool, optional
+        If `True`, the function will assume that `sigma` are one-sigma errors in `y`. Otherwise, the function will attempt to
+        find a normalization for `sigma` that is most consistent with the observed discrepancies between `y` and `y_model`
+
+    Returns
+    -------
+    array_like
+        Covariance matrix with shape (len(best_fit), len(best_fit))
+    """
+    # Prepare `fixed_param_errors` in the correct format
+    if type(fixed_param_errors) is bool:
+        fixed_param_errors = np.full(len(best_fit), np.nan)
+    fixed_param_errors = np.array(fixed_param_errors)
+    assert len(fixed_param_errors) == len(best_fit)
+
+    # Split the Jacobian into fitted and fixed parameters
+    fixed_index = np.where(~np.isnan(fixed_param_errors))[0]
+    fitted_index  = np.where(np.isnan(fixed_param_errors))[0]
+    weighted_jacobian = jacobian * (1 / sigma)[:, np.newaxis]
+    jac_fixed = weighted_jacobian[:, fixed_index]
+    jac_fitted = weighted_jacobian[:, fitted_index]
+
+    # Compute the fitted covariance matrix using Moore-Penrose inverse (mimicking scipy's curve_fit)
+    if len(fitted_index) == 0:
+        cov_fitted = np.zeros([0, 0])
+    else:
+        U, s, VT = scp.linalg.svd(jac_fitted, full_matrices = False)
+        threshold = np.finfo(float).eps * max(jac_fitted.shape) * s[0]
+        s = s[s > threshold]
+        VT = VT[:s.size]
+        cov_fitted = np.dot(VT.T / s ** 2, VT)
+
+    # Covariance matrix of fixed parameters under the assumption of independence
+    cov_fixed = np.diag(fixed_param_errors[fixed_index] ** 2.0)
+
+    # Interactions between fitted and fixed parameters
+    K = -cov_fitted @ jac_fitted.T @ jac_fixed
+
+    # Rescale sigma based on observed residuals if necessary
+    if not absolute_sigma:
+        residuals = (y - y_model) / sigma
+        chi2_red = np.sum(residuals ** 2) / (np.shape(jacobian)[0] - np.shape(jacobian)[1])
+        cov_fitted *= chi2_red
+
+    # Propagate the uncertainties in fixed parameters into the fitted covariance
+    cov_fitted = cov_fitted + K @ cov_fixed @ K.T
+
+    # Assemble the full fitted+fixed covariance matrix
+    cov = np.zeros([cov_fitted.shape[0] + cov_fixed.shape[0]] * 2)
+    cov[np.ix_(fitted_index, fitted_index)] = cov_fitted
+    cov[np.ix_(fixed_index, fixed_index)] = cov_fixed
+    cov[np.ix_(fitted_index, fixed_index)] = K @ cov_fixed
+    cov[np.ix_(fixed_index, fitted_index)] = cov[np.ix_(fitted_index, fixed_index)].T
+
+    return cov
+
+def fit_model(wl, flux, ivar, initial, priors, dof, errors, interpolator, arm_index, phot, method):
     """Fit the model to the spectrum
-    
+
     Helper function to `chemfit()`. It sets up a model callback for `scp.optimize.curve_fit()` with
     the appropriate signature, defines the initial guesses and bounds for all free parameters, applies
-    parameter masks and initiates the optimization routine
+    the fitting mask and initiates the optimization routine
 
     The results of the fit and the associated errors are placed in the `initial` and `errors` arguments
-    
+
     Parameters
     ----------
     wl : array_like
@@ -985,10 +1026,6 @@ def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator,
         List of parameters to be optimized. The rest are treated as fixed to their initial values
     errors : dict
         Estimate errors in the best-fit parameter values are placed in this dictionary
-    masks : dict
-        Dictionary of boolean masks, keyed by stellar parameters. The masks determine which wavelengths are
-        included in the fit for each parameter. If multiple parameters are fit simultaneously, the masks are
-        logically added (or)
     interpolator : ModelGridInterpolator
         Model grid interpolator object that will be used to construct models during optimization
     arm_index : array_like
@@ -1012,9 +1049,8 @@ def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator,
     Returns
     -------
     dict
-        Additional data from the fit as returned by the fitting method callable function. If
-        `settings['return_diagnostics']`, will also return detailed diagnostic data, including the observed
-        spectrum, fitting masks and the best-fit model
+        Dictionary of additional diagnostic data. Refer to the documentation of `chemfit()` for detailed description
+        of the structure
     """
     # Create a dictionary to store diagnostic data in
     global _fitter_diagnostic_storage
@@ -1062,10 +1098,8 @@ def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator,
             raise ValueError('Unknown axis {}'.format(axis))
     bounds = np.array([get_bounds(axis) for axis in dof]).T
 
-    # Construct  and apply the fitting mask by superimposing the masks of individual parameters and removing bad pixels
-    mask = np.full(len(wl), False)
-    for param in dof:
-        mask |= masks[param]
+    # Construct the fitting mask
+    mask = ranges_to_mask(wl, settings['mask'], False)
     mask &= (ivar > 0) & (~np.isnan(ivar)) & (~np.isnan(flux))
     mask &= ~np.isnan(interpolator(initial)[1])
     x = wl[mask]; y = flux[mask]; sigma = ivar[mask] ** -0.5
@@ -1112,19 +1146,8 @@ def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator,
         fit = list(globals()['fit_{}'.format(method.split('+')[0])](f, x, y, p0, sigma, bounds))
 
     if method.endswith('cov') or method.endswith('jac'):
-        # Estimate the covariance matrix from the Jacobian using the standard formula
-        #       COV = (J^T x diag(IVAR) x J)^-1 * CHI^2_REDUCED
-        # where
-        #       CHI^2_REDUCED = (SUM((OBSERVED - MODEL)^2 * IVAR) / (N_points - N_params))
-        jacobian = scp.optimize._numdiff.approx_derivative(lambda args: f(x, *args), fit[0], bounds = bounds)
-        residuals = (y - f(x, *fit[0])) / sigma
-        chi2_red = np.sum(residuals ** 2) / (np.shape(jacobian)[0] - np.shape(jacobian)[1])
-        weighted_jacobian = jacobian * (1 / sigma)[:, np.newaxis]
-        U, s, VT = scp.linalg.svd(weighted_jacobian, full_matrices = False)
-        threshold = np.finfo(float).eps * max(weighted_jacobian.shape) * s[0]
-        s = s[s > threshold]
-        VT = VT[:s.size]
-        cov = (VT.T / s**2) @ VT * chi2_red
+        jacobian = compute_jacobian(f, x, fit[0], bounds)
+        cov = compute_covariance(jacobian, x, y, sigma, f(x, *fit[0]), fit[0])
         extra = {'cov': cov}
         if method.endswith('jac'):
             extra['jac'] = jacobian
@@ -1138,27 +1161,26 @@ def fit_model(wl, flux, ivar, initial, priors, dof, errors, masks, interpolator,
         initial[param] = fit[0][i]
         errors[param] = fit[1][i]
 
-    # Provide diagnostic data if requested
-    if settings['return_diagnostics']:
-        fit[2]['observed'] = {'wl': wl, 'flux': flux, 'ivar': ivar}
-        fit[2]['mask'] = mask
-        fit[2]['fit'] = {'x': x, 'y': y, 'sigma': sigma, 'f': f(x, *fit[0]), 'p0': p0, 'bounds': bounds, 'dof': dof, 'priors': prior_labels[::-1]}
-        fit[2]['model'] = {'wl': diagnostic['model_wl'], 'flux': diagnostic['model_flux'], 'cont': diagnostic['model_cont']}
-        fit[2]['cost'] = (fit[2]['fit']['f'] - fit[2]['fit']['y']) ** 2.0 / fit[2]['fit']['sigma'] ** 2.0
-        fit[2]['arm_index'] = arm_index
+    # Provide diagnostic data
+    fit[2]['observed'] = {'wl': wl, 'flux': flux, 'ivar': ivar}
+    fit[2]['mask'] = mask
+    fit[2]['fit'] = {'x': x, 'y': y, 'sigma': sigma, 'f': f(x, *fit[0]), 'p0': p0, 'bounds': bounds, 'dof': dof, 'priors': prior_labels[::-1]}
+    fit[2]['model'] = {'wl': diagnostic['model_wl'], 'flux': diagnostic['model_flux'], 'cont': diagnostic['model_cont']}
+    fit[2]['cost'] = (fit[2]['fit']['f'] - fit[2]['fit']['y']) ** 2.0 / fit[2]['fit']['sigma'] ** 2.0
+    fit[2]['arm_index'] = arm_index
 
     return fit[2]
 
 def fit_gradient_descent(f, x, y, p0, sigma, bounds):
     """Fit a 2D data series to a model using the Trust Region Reflective gradient descent algorithm
-    
+
     The fit is carried out using `scipy.optimize.curve_fit()`. The covariance matrix is returned as
     additional data
-    
+
     Parameters
     ----------
     See the parameters of `scipy.optimize.curve_fit()`
-    
+
     Returns
     -------
     best : array_like
@@ -1170,9 +1192,11 @@ def fit_gradient_descent(f, x, y, p0, sigma, bounds):
     """
     options = copy.deepcopy(settings['gradient_descent']['curve_fit'])
     # If the total number of data points is 1, it is impossible to normalize chi^2 so we need to
-    # treat the provided errors as absolute regardless of the settings
+    # treat the provided errors as absolute
     if len(x) == 1:
         options['absolute_sigma'] = True
+    else:
+        options['absolute_sigma'] = False
     fit = scp.optimize.curve_fit(f, x, y, p0 = p0, sigma = sigma, bounds = bounds, **options)
     best = fit[0]
     errors = np.sqrt(np.diagonal(fit[1]))
@@ -1180,17 +1204,17 @@ def fit_gradient_descent(f, x, y, p0, sigma, bounds):
 
 def mcmc_convergence(chain, c = 5):
     """Calculate the convergence parameters of an MCMC chain
-    
+
     This function takes the chain output by emcee, and computes the auto-correlation length and the
     Geweke drift for each dimension of the parameter space
-    
+
     Parameters
     ----------
     chain : array_like
         MCMC chain as returned by `emcee.EnsembleSampler().get_chain()`
     c : number, optional
         Step size for the auto-correlation window search (see `emcee.autocorr.integrated_time()`)
-    
+
     Returns
     -------
     autocorr : array_like
@@ -1231,16 +1255,16 @@ def mcmc_convergence(chain, c = 5):
 
 def fit_mcmc(f, x, y, p0, sigma, bounds):
     """Fit a 2D data series to a model using Markov Chain Monte Carlo (MCMC) sampling
-    
+
     The fit is carried out using `emcee.EnsembleSampler()`. The MCMC chains for individual walkers are
     returned as additional data. The initial positions of the walkers are drawn from a random uniform
     distribution, within the prescribed bounds. The best-fit parameters and their errors are calculated
     as the median and the standard deviation of the chains after the removal of the burn-in steps
-    
+
     Parameters
     ----------
     See the parameters of `scipy.optimize.curve_fit()`
-    
+
     Returns
     -------
     best : array_like
@@ -1292,8 +1316,13 @@ def fit_mcmc(f, x, y, p0, sigma, bounds):
     return np.median(flatchain, axis = 0), np.std(flatchain, axis = 0), extra
 
 def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent', dof = False):
-    """Determine the stellar parameters of a star given its spectrum
-    
+    """Infer the stellar parameters of a star given its observed spectrum
+
+    Note that this is an internal function that is rarely called directly by the user. In general,
+    the user is expected to call the wrappers implemented in specific settings presets. In particular,
+    this function is agnostic to how stellar models are evaluated and the associated physics. For this
+    reason, the input arguments do not have prescribed units
+
     Parameters
     ----------
     wl : dict
@@ -1307,8 +1336,8 @@ def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent', dof
         by the model grid must be listed, except those for which default initial guesses are defined
         in `settings['default_initial']`. The value of each element is either a float or a
         2-element tuple. In the former case, the value is treated as the initial guess to the
-        fitter. Otherwise, the first element is treated as an initial guess and the second value
-        is treated as the prior uncertainty in the parameter
+        fitter (if applicable). Otherwise, the first element is treated as an initial guess and the
+        second element is treated as the statistical prior
     phot : dict, optional
         Photometric colors of the star (if available). The colors and the spectrum will be fit to
         the models simultaneously to attain stricter constraints on the stellar parameters. Each
@@ -1327,25 +1356,82 @@ def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent', dof
         Jacobian using the standard error propagation formula. If this argument is set to 'jac', both
         the covariance matrix and the Jacobian will be returned. Finally, 'gradient_descent'/'mcmc'
         can be combined with 'cov'/'jac' uing '+' (e.g. 'gradient_descent+jac'), in which case the
-        optimizer will be ran first and the covariance matrix and/or Jacobian will be computed around
-        the best-fit values
+        optimizer will be run first and the covariance matrix and/or Jacobian will be computed around
+        the best-fit values after the fact
     dof : list
         List of degrees of freedom to fit for. Defaults to `False`, in which case the list is adopted
         from `settings['fit_dof']`
-    
+
     Returns
     -------
     dict
-        Fitting results. Dictionary with the following keys:
-            'fit': Best-fit stellar parameters
-            'errors': Standard errors in the best-fit parameters from the diagonal of covariance matrix
-            'interpolator_statistics': Interpolator statistics (see `ModelGridInterpolator().statistics`)
-            'warnings': Warnings issued during the fitting process
-            'extra': Additional fit data and diagnostic data depending on the chosen fitting method
-    """
-    # Remember the length of pre-existing warnings stack
-    warnings_stack_length = len(warnings_stack)
+        Fitting results. This is a multi-level dictionary with the following keys:
 
+        - [fit]: Values of best-fit parameters, including both real dimensions of the model grid and
+                 virtual dimensions. Note that fixed parameters (i.e. parameters not listed in `dof`
+                 are also included here with their initial values). If `method` is 'mcmc', the best-fit values
+                 are estimated as median values of the flattened MCMC chain
+        - [errors]: Errors in the best-fit parameters. The errors are only provided for those parameters
+                    that were treated as degrees of freedom in the fit. Iff `method` is 'mcmc', the errors are
+                    estimated as standard deviations of the flattened MCMC chain
+        - [interpolator_statistics]: Statistics to track the performance of the model interpolator. See the
+                                     `class ModelGridInterpolator` documentation for details
+        - [extra]: Additional diagnostic data produced by the fitter, described below
+        - [extra][observed]: The observed spectrum provided to the fitter. The sub-keys include [wl]
+                             (wavelength), [flux] (flux density) and [ivar] (inverse variance), all stored
+                             as arm-merged arrays (see `combine_arms()`)
+        - [extra][model]: The best-fit model inferred by the fitter. The sub-keys include [wl] (wavelength),
+                          [flux] (flux density) and [cont] (continuum normalization computed with
+                          `estimate_continuum()`), all stored as arm-merged arrays. Note that in general the
+                          wavelength array here should be identical to [extra][observed][wl]
+        - [extra][mask]: The fitting mask used by the fitter. This mask evaluates to `True` for all pixels that
+                         were included in the fit. Note that statistical and photometric priors are treated as
+                         additional pixels added at the beginning of the spectrum. With such priors in place, the
+                         length of the mask array would be longer than the lengths of arrays in [extra][observed]
+                         and [extra][model]
+        - [extra][fit][x]: The exact array of x-values given to the optimizer. In general, this is the wavelength
+                           array, prepended with extra pixels for statistical and photometric priors and with bad
+                           and masked out pixels removed
+        - [extra][fit][y]: The array of y-values given to the optimizer, corresponding to [extra][fit][x]
+        - [extra][fit][sigma]: The array of sigma-values (uncertainties) given to the optimizer, corresponding to
+                               [extra][fit][x]
+        - [extra][fit][f]: The array of best-fit model y-values, corresponding to [extra][fit][x]
+        - [extra][fit][dof]: The full list of degrees of freedom considered by the optimizer
+        - [extra][fit][p0]: The initial values for those degrees of freedom given to the optimizer
+        - [extra][fit][bounds]: The bounds on those degrees of freedom given to the optimizer
+        - [extra][fit][priors]: The full list of statistical and photometric priors used in the fit, listed in
+                                the same order as the corresponding pixels added at the beginning of the spectrum
+        - [extra][cost]: Chi-squared cost (observed - model) ^2 / error ^2 that corresponds to each pixel in
+                         [extra][fit][x], [extra][fit][y] etc.
+        - [extra][arm_index]: The arm index of each pixel in [extra][observed] and [extra][model]. The arm index is an
+                              integer that corresponds to the serial number of the arm that the pixel belongs to. The
+                              arms are indexed in the alphabetical order starting with 0
+        - [extra][cov]: Covariance matrix of the fit. This is a square matrix of shape NxN, where N is the total number
+                        of degrees of freedom listed in [extra][fit][dof]. Returned only when `method` is 'gradient_descent',
+                        or when `method` is set to explicitly request the covariance matrix or the Jacobian. Regardless of the
+                        fitting method, the covariance matrix is always estimated using standard error propagation from the
+                        Jacobian, evaluated at the best-fit parameters
+        - [extra][jac]: Jacobian matrix of the fit. This is a matrix of shape MxN, where N is the total number of degrees of
+                        freedom listed in [extra][fit][dof], and M is the total number of pixels (included the added pixels
+                        for statistical and photometric priors) listed in [extra][fit][x]. The Jacobian is computed at the
+                        best-fit parameters using finite differences. Returned only when `method` is set to explicitly request
+                        the Jacobian
+        - [extra][chain]: Full MCMC chain. Array of shape IxJxN where I is the number of MCMC steps (`settings['mcmc']['nsteps']`),
+                          J is the number of MCMC walkers (`settings['mcmc']['nwalkers']`) and N is the total number of degrees of
+                          freedom listed in [extra][fit][dof]. Returned only when `method` is 'mcmc'
+        - [extra][log_prob]: Logarithmic probabilities that correspond to the MCMC chain in [extra][chain]. This is an array of
+                             shape IxJ. Returned only when `method` is 'mcmc'
+        - [extra][initial]: Initial positions of MCMC walkers. Returned only when `method` is 'mcmc'
+        - [extra][autocorr]: Auto-correlation lengths for each degree of freedom listed in [extra][fit][dof]. Refer to
+                             `mcmc_convergence()` for details. Returned only when `method` is 'mcmc'
+        - [extra][geweke]: Geweke scores for each degree of freedom listed in [extra][fit][dof]. Refer to `mcmc_convergence()` for
+                           details. Returned only when `method` is 'mcmc'
+        - [extra][gradient_descent]: If `method` is 'mcmc' and `settings['mcmc']['initial']` is 'gradient_descent', the fitter will
+                                     generate the initial positions of the walkers by first running the fit with `method ==
+                                     'gradient_descent'`, and then using the derived best-fit parameters and their errors to draw
+                                     the initial walker positions from the normal distribution. In this case, said best-fit values,
+                                     errors and the covariance matrix are saved under this key
+    """
     # Set default initial guesses
     initial = copy.deepcopy(initial)
     if 'default_initial' in settings:
@@ -1373,52 +1459,27 @@ def chemfit(wl, flux, ivar, initial, phot = {}, method = 'gradient_descent', dof
         mag_system = settings['default_mag_system']
     interpolator = ModelGridInterpolator(detector_wl = wl, synphot_bands = synphot_bands, reddening = reddening, mag_system = mag_system, dof = dof, max_models = settings['max_model_cache'])
 
-    # Get the fitting masks for each parameter
-    masks = {}
-    for param in initial:
-        mask = {}
-        ranges_specific = []
-        ranges_general = []
-        for arm in wl:
-            if (arm in settings['masks']) and (param in settings['masks'][arm]):
-                ranges_specific += list(settings['masks'][arm][param])
-            if ('all' in settings['masks']) and (param in settings['masks']['all']):
-                ranges_specific += list(settings['masks']['all'][param])
-            if (arm in settings['masks']) and ('all' in settings['masks'][arm]):
-                ranges_general += list(settings['masks'][arm]['all'])
-            if ('all' in settings['masks']) and ('all' in settings['masks']['all']):
-                ranges_general += list(settings['masks']['all']['all'])
-        masks[param] = ranges_to_mask(wl_combined, ranges_general)
-        if len(ranges_specific) != 0:
-            masks[param] &= ranges_to_mask(wl_combined, ranges_specific)
-    # Run the continuum fitter once to give it a chance to update the fitting masks if it needs to
-    cont = estimate_continuum(wl_combined, flux_combined, ivar_combined, npix = settings['cont_pix'], k = settings['spline_order'], masks = masks, arm_index = arm_index)
-
     # Preliminary setup
     fit = {param: np.atleast_1d(initial[param])[0] for param in initial}       # Initial guesses for the fitter
     errors = {}                                                                # Placeholder for fitting errors
 
     # Run the main fitter
-    extra = fit_model(wl_combined, flux_combined, ivar_combined, fit, initial, np.atleast_1d(dof), errors, masks, interpolator, arm_index, phot, method = method)
+    extra = fit_model(wl_combined, flux_combined, ivar_combined, fit, initial, np.atleast_1d(dof), errors, interpolator, arm_index, phot, method = method)
 
-    # Get the texts of unique issued warnings
-    warnings = np.unique(warnings_stack[warnings_stack_length:])
-    inv_warnings_messages = {warnings_messages[key]: key for key in warnings_messages}
-    warnings = [inv_warnings_messages[warning_id] for warning_id in warnings]
     interpolator_statistics = copy.deepcopy(interpolator.statistics)
     del interpolator
 
-    return {'fit': fit, 'errors': errors, 'extra': extra, 'interpolator_statistics': interpolator_statistics, 'warnings': warnings}
+    return {'fit': fit, 'errors': errors, 'extra': extra, 'interpolator_statistics': interpolator_statistics}
 
-def synphot(wl, flux, teff, bands, mag_system = settings['default_mag_system'], reddening = settings['default_reddening']):
+def synphot(wl, flux, teff, bands, mag_system = settings['default_mag_system'], reddening = settings['default_reddening'], Rv = 3.1):
     """Calculate synthetic photometry for a given spectrum
 
-    The function supports reddening corrections. Reddening is parameterized by a single degree of freedom
-    that is the optical reddening, E(B-V). The function applies extinction to each pixel of the spectrum,
-    using the FM07 reddening law implemented in the `extinction` Python module. Rv=3.1 is assumed
+    The function supports reddening corrections. Reddening is parameterized by the optical reddening,
+    E(B-V), and the total-to-selective extinction, Rv. The function applies extinction to each pixel of
+    the spectrum, using the G23 reddening law implemented in the `dust_extinction` Python module.
 
     The output of the function is bolometric corrections. Photometric colors can then be calculated as the
-    inverted differences of bolometric corrections. E.g. to compute B-V, the bolometric correction of B is
+    nevative differences of bolometric corrections. E.g. to compute B-V, the bolometric correction of B is
     subtracted from the bolometric correction of V. Absolute magnitudes can be estimated if the bolometric
     luminosity of the star is known, e.g. from an evolutionary model
 
@@ -1435,7 +1496,7 @@ def synphot(wl, flux, teff, bands, mag_system = settings['default_mag_system'], 
         Filenames that store the transmission profiles of the photometric bands to calculate synthetic
         photometry in. Only the basenames must be provided (i.e. no paths). The files must be stored in
         `settings['filter_dir']`. Each file should be a whitespace-separated ASCII table with two columns:
-        wavelength in A, and transmission (between 0 and 1)
+        AIR wavelength in A, and transmission (between 0 and 1)
     mag_system : str, optional
         Magnitude system for synthetic photometry. This must be either `ABMAG` or one of the keys of the
         `settings['mag_systems']` dictionary. If it is the latter, the value of the dictionary must be the
@@ -1445,6 +1506,8 @@ def synphot(wl, flux, teff, bands, mag_system = settings['default_mag_system'], 
     reddening : number, optional
         Optical reddening to incorporate in the synthetic photometry, E(B-V) in mag. The argument defaults to
         the value in `settings['default_reddening']`
+    Rv : number, optional
+        Total-to-selective extinction ratio, Rv. Defaults to the standard Milky Way value of 3.1
 
     Returns
     -------
@@ -1504,11 +1567,19 @@ def synphot(wl, flux, teff, bands, mag_system = settings['default_mag_system'], 
 
         if reddening != 0.0:
             try:
-                import extinction
+                from dust_extinction.parameter_averages import G23
+                from astropy import units as u
+                extmod = G23(Rv = Rv)
             except:
-                raise ValueError('Could not import the extinction module. For extinguished photometry, make sure the module is installed ( https://github.com/kbarbary/extinction ).')
-            Rv = 3.1 # Rv must be 3.1 for the FM07 law
-            A = extinction.fm07(wl, reddening * Rv)
+                raise ValueError('Could not import the dust_extinction module. For extinguished photometry, make sure the module is installed ( https://dust-extinction.readthedocs.io/en/latest/ ).')
+            def extinction_law(wl):
+                result = np.zeros(len(wl))
+                wl_min = 912
+                wl_max = 320000
+                mask = (wl > wl_min) & (wl < wl_max)
+                result[mask] = extmod(np.array(wl)[mask]  * u.Angstrom) * reddening * Rv
+                return result
+            A = extinction_law(wl)
         else:
             A = 0.0
 
