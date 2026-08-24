@@ -1587,6 +1587,6 @@ def synphot(wl, flux, teff, bands, mag_system = settings['default_mag_system'], 
         f1 = wl * flux * filter_t * 10 ** (-A / 2.5) * np.pi
         f2 = f_ref_wl * f_ref_flux * filter_t_ref
         # Equation 4 from Gerasimov+2022
-        result[band] = 2.5 * np.log10(np.trapz(f1, wl) / np.trapz(f2, f_ref_wl)) - 10 * np.log10(teff / 1000) + C
+        result[band] = 2.5 * np.log10(np.trapezoid(f1, wl) / np.trapezoid(f2, f_ref_wl)) - 10 * np.log10(teff / 1000) + C
 
     return result
